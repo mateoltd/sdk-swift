@@ -1,0 +1,12 @@
+{
+  "aliasReferenceSchemaVersion": 1,
+  "artifactArchiveSha256": "790f9565225f6bec80b2fcb96f6d95acba4460470ea3e5efc179e68ffa6b44f6",
+  "binaryZipSha256": "16eab95682836fc9382cdb8e3417911e510a4f379e38eef05c750e1ea0544fb7",
+  "distributionArchitectures": {
+    "ios": ["arm64"],
+    "iosSimulator": ["arm64"]
+  },
+  "packageVersion": "0.2.0-alias-platform.3",
+  "sourceBaseCommit": "4a08b5fe81c363169d36f582cc13c03b59d212d8",
+  "sourceCommit": "8e15f78d18a49c42f235c9698df794306754d6ac"
+}

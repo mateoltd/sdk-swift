@@ -23,12 +23,13 @@ let package = Package(
         // Targets can depend on other targets in this package, and on products in packages this package depends on.
         .target(
             name: "BitwardenSdk",
-            dependencies: ["BitwardenFFI"],
+            dependencies: ["BitwardenFFI", "BitwardenSdkSupport"],
             swiftSettings: [.unsafeFlags(["-suppress-warnings"])]),
+        .target(name: "BitwardenSdkSupport"),
         .binaryTarget(
             name: "BitwardenFFI",
-            url: "https://bwlivefronttest.blob.core.windows.net/sdk/7641717-BitwardenFFI.xcframework.zip",
-            checksum: "f802265346d49cb39c4284e2ffe68c4b4aa579b5792e5e137627eeec6d9872aa"),
+            url: "https://raw.githubusercontent.com/mateoltd/sdk-swift/f4904102b838d65b929d85eeab2f73c42614e793/BitwardenFFI.xcframework.zip",
+            checksum: "16eab95682836fc9382cdb8e3417911e510a4f379e38eef05c750e1ea0544fb7"),
         .testTarget(
             name: "BitwardenSdkTests",
             dependencies: ["BitwardenSdk"])

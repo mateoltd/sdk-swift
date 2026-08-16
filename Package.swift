@@ -28,7 +28,7 @@ let package = Package(
         .target(name: "BitwardenSdkSupport"),
         .binaryTarget(
             name: "BitwardenFFI",
-            url: "https://raw.githubusercontent.com/mateoltd/sdk-swift/feat/provider-neutral-alias-v1/BitwardenFFI.xcframework.zip",
+            url: "https://raw.githubusercontent.com/mateoltd/sdk-swift/8e036f70967f8a8daa1c186d5446ad6a5d07584e/BitwardenFFI.xcframework.zip",
             checksum: "95ae5e88f53c5b6f24ac56a259c0472b12f24d10b722706e4b70a93fd49c315f"),
         .testTarget(
             name: "BitwardenSdkTests",

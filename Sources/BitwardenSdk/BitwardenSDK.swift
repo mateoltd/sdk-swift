@@ -441,38 +441,6 @@ fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
-    typealias FfiType = UInt32
-    typealias SwiftType = UInt32
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt32 {
-        return try lift(readInt(&buf))
-    }
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        writeInt(&buf, lower(value))
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
-    typealias FfiType = UInt64
-    typealias SwiftType = UInt64
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt64 {
-        return try lift(readInt(&buf))
-    }
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        writeInt(&buf, lower(value))
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -590,712 +558,6 @@ fileprivate struct FfiConverterTimestamp: FfiConverterRustBuffer {
         writeInt(&buf, nanoseconds)
     }
 }
-
-
-
-
-/**
- * Complete SimpleLogin alias lifecycle operations for Swift and Kotlin consumers.
- */
-public protocol AliasClientProtocol: AnyObject, Sendable {
-    
-    /**
-     * Creates the canonical serialized reference for alias data returned by this client.
-     */
-    func createAliasReference(alias: Alias) throws  -> SensitiveString
-    
-    /**
-     * Creates a contact and returns its reverse alias.
-     */
-    func createContact(aliasId: AliasId, contact: SensitiveString) async throws  -> ReverseAlias
-    
-    /**
-     * Creates a custom alias using a signed suffix from [`Self::get_alias_options`].
-     */
-    func createCustomAlias(request: CreateCustomAliasRequest) async throws  -> Alias
-    
-    /**
-     * Creates a random alias.
-     */
-    func createRandomAlias(request: CreateRandomAliasRequest) async throws  -> Alias
-    
-    /**
-     * Creates or retrieves a reverse alias for a contact.
-     */
-    func createReverseAlias(aliasId: AliasId, contact: SensitiveString) async throws  -> ReverseAlias
-    
-    /**
-     * Deletes an alias.
-     */
-    func deleteAlias(aliasId: AliasId) async throws  -> DeleteAliasResult
-    
-    /**
-     * Deletes a contact and its reverse alias.
-     */
-    func deleteContact(contactId: ContactId) async throws  -> DeleteContactResult
-    
-    /**
-     * Disables an alias.
-     */
-    func disableAlias(aliasId: AliasId) async throws  -> AliasState
-    
-    /**
-     * Enables an alias.
-     */
-    func enableAlias(aliasId: AliasId) async throws  -> AliasState
-    
-    /**
-     * Gets full lifecycle data for a stable alias identifier.
-     */
-    func getAlias(aliasId: AliasId) async throws  -> Alias
-    
-    /**
-     * Gets alias creation options and any hostname recommendation.
-     */
-    func getAliasOptions(hostname: SensitiveString?) async throws  -> AliasCreationOptions
-    
-    /**
-     * Gets the most recently associated alias for a hostname.
-     */
-    func getAliasRecommendation(hostname: SensitiveString) async throws  -> AliasRecommendation?
-    
-    /**
-     * Lists a page of aliases.
-     */
-    func listAliases(page: UInt32, filter: AliasFilter?) async throws  -> AliasPage
-    
-    /**
-     * Lists contacts for an alias.
-     */
-    func listContacts(aliasId: AliasId, page: UInt32) async throws  -> ReverseAliasPage
-    
-    /**
-     * Lists account custom domains.
-     */
-    func listCustomDomains() async throws  -> [CustomDomain]
-    
-    /**
-     * Lists domains available for random alias creation.
-     */
-    func listDomains() async throws  -> [AliasDomain]
-    
-    /**
-     * Lists account forwarding mailboxes.
-     */
-    func listMailboxes() async throws  -> [Mailbox]
-    
-    /**
-     * Lists contacts and their reverse aliases.
-     */
-    func listReverseAliases(aliasId: AliasId, page: UInt32) async throws  -> ReverseAliasPage
-    
-    /**
-     * Returns the stable non-secret identity that selects this provider connection.
-     */
-    func providerIdentity() throws  -> AliasProviderIdentity
-    
-    /**
-     * Searches aliases by address, note, and name.
-     */
-    func searchAliases(request: SearchAliasesRequest) async throws  -> AliasPage
-    
-    /**
-     * Explicitly sets alias forwarding state.
-     */
-    func setAliasEnabled(aliasId: AliasId, enabled: Bool) async throws  -> AliasState
-    
-    /**
-     * Toggles whether a contact is blocked.
-     */
-    func toggleContactBlocked(contactId: ContactId) async throws  -> ContactState
-    
-    /**
-     * Updates mutable alias fields.
-     */
-    func updateAlias(aliasId: AliasId, request: AliasUpdateRequest) async throws  -> Alias
-    
-    /**
-     * Updates mutable custom-domain settings.
-     */
-    func updateCustomDomain(domainId: CustomDomainId, request: CustomDomainUpdateRequest) async throws  -> CustomDomain
-    
-}
-/**
- * Complete SimpleLogin alias lifecycle operations for Swift and Kotlin consumers.
- */
-open class AliasClient: AliasClientProtocol, @unchecked Sendable {
-    fileprivate let handle: UInt64
-
-    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public struct NoHandle {
-        public init() {}
-    }
-
-    // TODO: We'd like this to be `private` but for Swifty reasons,
-    // we can't implement `FfiConverter` without making this `required` and we can't
-    // make it `required` without making it `public`.
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    required public init(unsafeFromHandle handle: UInt64) {
-        self.handle = handle
-    }
-
-    // This constructor can be used to instantiate a fake object.
-    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
-    //
-    // - Warning:
-    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public init(noHandle: NoHandle) {
-        self.handle = 0
-    }
-
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_bitwarden_uniffi_fn_clone_aliasclient(self.handle, $0) }
-    }
-    /**
-     * Creates a standalone alias lifecycle client.
-     */
-public convenience init(settings: AliasClientSettings)throws  {
-    let handle =
-        try rustCallWithError(FfiConverterTypeAliasError_lift) {
-    uniffi_bitwarden_uniffi_fn_constructor_aliasclient_new(
-        FfiConverterTypeAliasClientSettings_lower(settings),$0
-    )
-}
-    self.init(unsafeFromHandle: handle)
-}
-
-    deinit {
-        if handle == 0 {
-            // Mock objects have handle=0 don't try to free them
-            return
-        }
-
-        try! rustCall { uniffi_bitwarden_uniffi_fn_free_aliasclient(handle, $0) }
-    }
-
-    
-
-    
-    /**
-     * Creates the canonical serialized reference for alias data returned by this client.
-     */
-open func createAliasReference(alias: Alias)throws  -> SensitiveString  {
-    return try  FfiConverterTypeSensitiveString_lift(try rustCallWithError(FfiConverterTypeAliasReferenceError_lift) {
-    uniffi_bitwarden_uniffi_fn_method_aliasclient_create_alias_reference(
-            self.uniffiCloneHandle(),
-        FfiConverterTypeAlias_lower(alias),$0
-    )
-})
-}
-    
-    /**
-     * Creates a contact and returns its reverse alias.
-     */
-open func createContact(aliasId: AliasId, contact: SensitiveString)async throws  -> ReverseAlias  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_create_contact(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeAliasId_lower(aliasId),FfiConverterTypeSensitiveString_lower(contact)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeReverseAlias_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Creates a custom alias using a signed suffix from [`Self::get_alias_options`].
-     */
-open func createCustomAlias(request: CreateCustomAliasRequest)async throws  -> Alias  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_create_custom_alias(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeCreateCustomAliasRequest_lower(request)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeAlias_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Creates a random alias.
-     */
-open func createRandomAlias(request: CreateRandomAliasRequest)async throws  -> Alias  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_create_random_alias(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeCreateRandomAliasRequest_lower(request)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeAlias_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Creates or retrieves a reverse alias for a contact.
-     */
-open func createReverseAlias(aliasId: AliasId, contact: SensitiveString)async throws  -> ReverseAlias  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_create_reverse_alias(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeAliasId_lower(aliasId),FfiConverterTypeSensitiveString_lower(contact)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeReverseAlias_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Deletes an alias.
-     */
-open func deleteAlias(aliasId: AliasId)async throws  -> DeleteAliasResult  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_delete_alias(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeAliasId_lower(aliasId)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeDeleteAliasResult_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Deletes a contact and its reverse alias.
-     */
-open func deleteContact(contactId: ContactId)async throws  -> DeleteContactResult  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_delete_contact(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeContactId_lower(contactId)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeDeleteContactResult_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Disables an alias.
-     */
-open func disableAlias(aliasId: AliasId)async throws  -> AliasState  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_disable_alias(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeAliasId_lower(aliasId)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeAliasState_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Enables an alias.
-     */
-open func enableAlias(aliasId: AliasId)async throws  -> AliasState  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_enable_alias(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeAliasId_lower(aliasId)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeAliasState_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Gets full lifecycle data for a stable alias identifier.
-     */
-open func getAlias(aliasId: AliasId)async throws  -> Alias  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_get_alias(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeAliasId_lower(aliasId)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeAlias_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Gets alias creation options and any hostname recommendation.
-     */
-open func getAliasOptions(hostname: SensitiveString?)async throws  -> AliasCreationOptions  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_get_alias_options(
-                    self.uniffiCloneHandle(),
-                    FfiConverterOptionTypeSensitiveString.lower(hostname)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeAliasCreationOptions_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Gets the most recently associated alias for a hostname.
-     */
-open func getAliasRecommendation(hostname: SensitiveString)async throws  -> AliasRecommendation?  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_get_alias_recommendation(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeSensitiveString_lower(hostname)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterOptionTypeAliasRecommendation.lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Lists a page of aliases.
-     */
-open func listAliases(page: UInt32, filter: AliasFilter?)async throws  -> AliasPage  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_list_aliases(
-                    self.uniffiCloneHandle(),
-                    FfiConverterUInt32.lower(page),FfiConverterOptionTypeAliasFilter.lower(filter)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeAliasPage_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Lists contacts for an alias.
-     */
-open func listContacts(aliasId: AliasId, page: UInt32)async throws  -> ReverseAliasPage  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_list_contacts(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeAliasId_lower(aliasId),FfiConverterUInt32.lower(page)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeReverseAliasPage_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Lists account custom domains.
-     */
-open func listCustomDomains()async throws  -> [CustomDomain]  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_list_custom_domains(
-                    self.uniffiCloneHandle()
-                    
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterSequenceTypeCustomDomain.lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Lists domains available for random alias creation.
-     */
-open func listDomains()async throws  -> [AliasDomain]  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_list_domains(
-                    self.uniffiCloneHandle()
-                    
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterSequenceTypeAliasDomain.lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Lists account forwarding mailboxes.
-     */
-open func listMailboxes()async throws  -> [Mailbox]  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_list_mailboxes(
-                    self.uniffiCloneHandle()
-                    
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterSequenceTypeMailbox.lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Lists contacts and their reverse aliases.
-     */
-open func listReverseAliases(aliasId: AliasId, page: UInt32)async throws  -> ReverseAliasPage  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_list_reverse_aliases(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeAliasId_lower(aliasId),FfiConverterUInt32.lower(page)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeReverseAliasPage_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Returns the stable non-secret identity that selects this provider connection.
-     */
-open func providerIdentity()throws  -> AliasProviderIdentity  {
-    return try  FfiConverterTypeAliasProviderIdentity_lift(try rustCallWithError(FfiConverterTypeAliasReferenceError_lift) {
-    uniffi_bitwarden_uniffi_fn_method_aliasclient_provider_identity(
-            self.uniffiCloneHandle(),$0
-    )
-})
-}
-    
-    /**
-     * Searches aliases by address, note, and name.
-     */
-open func searchAliases(request: SearchAliasesRequest)async throws  -> AliasPage  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_search_aliases(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeSearchAliasesRequest_lower(request)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeAliasPage_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Explicitly sets alias forwarding state.
-     */
-open func setAliasEnabled(aliasId: AliasId, enabled: Bool)async throws  -> AliasState  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_set_alias_enabled(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeAliasId_lower(aliasId),FfiConverterBool.lower(enabled)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeAliasState_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Toggles whether a contact is blocked.
-     */
-open func toggleContactBlocked(contactId: ContactId)async throws  -> ContactState  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_toggle_contact_blocked(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeContactId_lower(contactId)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeContactState_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Updates mutable alias fields.
-     */
-open func updateAlias(aliasId: AliasId, request: AliasUpdateRequest)async throws  -> Alias  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_update_alias(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeAliasId_lower(aliasId),FfiConverterTypeAliasUpdateRequest_lower(request)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeAlias_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-    /**
-     * Updates mutable custom-domain settings.
-     */
-open func updateCustomDomain(domainId: CustomDomainId, request: CustomDomainUpdateRequest)async throws  -> CustomDomain  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_bitwarden_uniffi_fn_method_aliasclient_update_custom_domain(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeCustomDomainId_lower(domainId),FfiConverterTypeCustomDomainUpdateRequest_lower(request)
-                )
-            },
-            pollFunc: ffi_bitwarden_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_bitwarden_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_bitwarden_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeCustomDomain_lift,
-            errorHandler: FfiConverterTypeAliasError_lift
-        )
-}
-    
-
-    
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeAliasClient: FfiConverter {
-    typealias FfiType = UInt64
-    typealias SwiftType = AliasClient
-
-    public static func lift(_ handle: UInt64) throws -> AliasClient {
-        return AliasClient(unsafeFromHandle: handle)
-    }
-
-    public static func lower(_ value: AliasClient) -> UInt64 {
-        return value.uniffiCloneHandle()
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AliasClient {
-        let handle: UInt64 = try readInt(&buf)
-        return try lift(handle)
-    }
-
-    public static func write(_ value: AliasClient, into buf: inout [UInt8]) {
-        writeInt(&buf, lower(value))
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeAliasClient_lift(_ handle: UInt64) throws -> AliasClient {
-    return try FfiConverterTypeAliasClient.lift(handle)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeAliasClient_lower(_ value: AliasClient) -> UInt64 {
-    return FfiConverterTypeAliasClient.lower(value)
-}
-
-
 
 
 
@@ -2816,11 +2078,6 @@ public func FfiConverterTypeCiphersClient_lower(_ value: CiphersClient) -> UInt6
 public protocol ClientProtocol: AnyObject, Sendable {
     
     /**
-     * Creates a SimpleLogin alias lifecycle client.
-     */
-    func aliases(settings: AliasClientSettings) throws  -> AliasClient
-    
-    /**
      * Auth operations
      */
     func auth()  -> AuthClient
@@ -2968,18 +2225,6 @@ public convenience init(tokenProvider: ClientManagedTokens, settings: ClientSett
 
     
 
-    
-    /**
-     * Creates a SimpleLogin alias lifecycle client.
-     */
-open func aliases(settings: AliasClientSettings)throws  -> AliasClient  {
-    return try  FfiConverterTypeAliasClient_lift(try rustCallWithError(FfiConverterTypeAliasError_lift) {
-    uniffi_bitwarden_uniffi_fn_method_client_aliases(
-            self.uniffiCloneHandle(),
-        FfiConverterTypeAliasClientSettings_lower(settings),$0
-    )
-})
-}
     
     /**
      * Auth operations
@@ -12690,105 +11935,6 @@ public func FfiConverterTypeVaultClient_lower(_ value: VaultClient) -> UInt64 {
 
 
 
-/**
- * Alias mutation input with unambiguous set, clear, and leave-unchanged semantics.
- */
-public struct AliasUpdateRequest: Equatable, Hashable {
-    /**
-     * Set or clear the private note; omission leaves it unchanged.
-     */
-    public let note: OptionalSensitiveStringUpdate?
-    /**
-     * Set or clear the display name; omission leaves it unchanged.
-     */
-    public let name: OptionalSensitiveStringUpdate?
-    /**
-     * Replace all forwarding mailboxes; omission leaves them unchanged.
-     */
-    public let mailboxIds: [MailboxId]?
-    /**
-     * Enable or disable PGP; omission leaves it unchanged.
-     */
-    public let disablePgp: Bool?
-    /**
-     * Pin or unpin the alias; omission leaves it unchanged.
-     */
-    public let pinned: Bool?
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * Set or clear the private note; omission leaves it unchanged.
-         */note: OptionalSensitiveStringUpdate?, 
-        /**
-         * Set or clear the display name; omission leaves it unchanged.
-         */name: OptionalSensitiveStringUpdate?, 
-        /**
-         * Replace all forwarding mailboxes; omission leaves them unchanged.
-         */mailboxIds: [MailboxId]?, 
-        /**
-         * Enable or disable PGP; omission leaves it unchanged.
-         */disablePgp: Bool?, 
-        /**
-         * Pin or unpin the alias; omission leaves it unchanged.
-         */pinned: Bool?) {
-        self.note = note
-        self.name = name
-        self.mailboxIds = mailboxIds
-        self.disablePgp = disablePgp
-        self.pinned = pinned
-    }
-
-    
-
-    
-}
-
-#if compiler(>=6)
-extension AliasUpdateRequest: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeAliasUpdateRequest: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AliasUpdateRequest {
-        return
-            try AliasUpdateRequest(
-                note: FfiConverterOptionTypeOptionalSensitiveStringUpdate.read(from: &buf), 
-                name: FfiConverterOptionTypeOptionalSensitiveStringUpdate.read(from: &buf), 
-                mailboxIds: FfiConverterOptionSequenceTypeMailboxId.read(from: &buf), 
-                disablePgp: FfiConverterOptionBool.read(from: &buf), 
-                pinned: FfiConverterOptionBool.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: AliasUpdateRequest, into buf: inout [UInt8]) {
-        FfiConverterOptionTypeOptionalSensitiveStringUpdate.write(value.note, into: &buf)
-        FfiConverterOptionTypeOptionalSensitiveStringUpdate.write(value.name, into: &buf)
-        FfiConverterOptionSequenceTypeMailboxId.write(value.mailboxIds, into: &buf)
-        FfiConverterOptionBool.write(value.disablePgp, into: &buf)
-        FfiConverterOptionBool.write(value.pinned, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeAliasUpdateRequest_lift(_ buf: RustBuffer) throws -> AliasUpdateRequest {
-    return try FfiConverterTypeAliasUpdateRequest.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeAliasUpdateRequest_lower(_ value: AliasUpdateRequest) -> RustBuffer {
-    return FfiConverterTypeAliasUpdateRequest.lower(value)
-}
-
-
 public struct CheckUserAndPickCredentialForCreationResult: Equatable, Hashable {
     public let cipher: CipherViewWrapper
     public let checkUserResult: CheckUserResult
@@ -12944,95 +12090,6 @@ public func FfiConverterTypeCipherViewWrapper_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeCipherViewWrapper_lower(_ value: CipherViewWrapper) -> RustBuffer {
     return FfiConverterTypeCipherViewWrapper.lower(value)
-}
-
-
-/**
- * Custom-domain mutation input with unambiguous display-name clearing.
- */
-public struct CustomDomainUpdateRequest: Equatable, Hashable {
-    /**
-     * Enable or disable catch-all generation; omission leaves it unchanged.
-     */
-    public let catchAll: Bool?
-    /**
-     * Enable or disable random-prefix generation; omission leaves it unchanged.
-     */
-    public let randomPrefixGeneration: Bool?
-    /**
-     * Set or clear the display name; omission leaves it unchanged.
-     */
-    public let name: OptionalSensitiveStringUpdate?
-    /**
-     * Replace all forwarding mailboxes; omission leaves them unchanged.
-     */
-    public let mailboxIds: [MailboxId]?
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * Enable or disable catch-all generation; omission leaves it unchanged.
-         */catchAll: Bool?, 
-        /**
-         * Enable or disable random-prefix generation; omission leaves it unchanged.
-         */randomPrefixGeneration: Bool?, 
-        /**
-         * Set or clear the display name; omission leaves it unchanged.
-         */name: OptionalSensitiveStringUpdate?, 
-        /**
-         * Replace all forwarding mailboxes; omission leaves them unchanged.
-         */mailboxIds: [MailboxId]?) {
-        self.catchAll = catchAll
-        self.randomPrefixGeneration = randomPrefixGeneration
-        self.name = name
-        self.mailboxIds = mailboxIds
-    }
-
-    
-
-    
-}
-
-#if compiler(>=6)
-extension CustomDomainUpdateRequest: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeCustomDomainUpdateRequest: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CustomDomainUpdateRequest {
-        return
-            try CustomDomainUpdateRequest(
-                catchAll: FfiConverterOptionBool.read(from: &buf), 
-                randomPrefixGeneration: FfiConverterOptionBool.read(from: &buf), 
-                name: FfiConverterOptionTypeOptionalSensitiveStringUpdate.read(from: &buf), 
-                mailboxIds: FfiConverterOptionSequenceTypeMailboxId.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: CustomDomainUpdateRequest, into buf: inout [UInt8]) {
-        FfiConverterOptionBool.write(value.catchAll, into: &buf)
-        FfiConverterOptionBool.write(value.randomPrefixGeneration, into: &buf)
-        FfiConverterOptionTypeOptionalSensitiveStringUpdate.write(value.name, into: &buf)
-        FfiConverterOptionSequenceTypeMailboxId.write(value.mailboxIds, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeCustomDomainUpdateRequest_lift(_ buf: RustBuffer) throws -> CustomDomainUpdateRequest {
-    return try FfiConverterTypeCustomDomainUpdateRequest.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeCustomDomainUpdateRequest_lower(_ value: CustomDomainUpdateRequest) -> RustBuffer {
-    return FfiConverterTypeCustomDomainUpdateRequest.lower(value)
 }
 
 
@@ -14026,88 +13083,6 @@ public func FfiConverterTypeLogLevel_lower(_ value: LogLevel) -> RustBuffer {
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * An explicit nullable text update for lifecycle fields where omission means "leave unchanged".
- */
-
-public enum OptionalSensitiveStringUpdate: Equatable, Hashable {
-    
-    /**
-     * Clear the existing value.
-     */
-    case clear
-    /**
-     * Replace the existing value.
-     */
-    case set(
-        /**
-         * New sensitive value.
-         */value: SensitiveString
-    )
-
-
-
-
-
-}
-
-#if compiler(>=6)
-extension OptionalSensitiveStringUpdate: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeOptionalSensitiveStringUpdate: FfiConverterRustBuffer {
-    typealias SwiftType = OptionalSensitiveStringUpdate
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OptionalSensitiveStringUpdate {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-        
-        case 1: return .clear
-        
-        case 2: return .set(value: try FfiConverterTypeSensitiveString.read(from: &buf)
-        )
-        
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: OptionalSensitiveStringUpdate, into buf: inout [UInt8]) {
-        switch value {
-        
-        
-        case .clear:
-            writeInt(&buf, Int32(1))
-        
-        
-        case let .set(value):
-            writeInt(&buf, Int32(2))
-            FfiConverterTypeSensitiveString.write(value, into: &buf)
-            
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeOptionalSensitiveStringUpdate_lift(_ buf: RustBuffer) throws -> OptionalSensitiveStringUpdate {
-    return try FfiConverterTypeOptionalSensitiveStringUpdate.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeOptionalSensitiveStringUpdate_lower(_ value: OptionalSensitiveStringUpdate) -> RustBuffer {
-    return FfiConverterTypeOptionalSensitiveStringUpdate.lower(value)
-}
-
-
 
 public enum RepositoryError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
@@ -14272,30 +13247,6 @@ public func FfiConverterTypeUIHint_lower(_ value: UiHint) -> RustBuffer {
     return FfiConverterTypeUIHint.lower(value)
 }
 
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterOptionBool: FfiConverterRustBuffer {
-    typealias SwiftType = Bool?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterBool.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterBool.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -14556,30 +13507,6 @@ fileprivate struct FfiConverterOptionTypeUserKeyStateRepository: FfiConverterRus
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeUserKeyStateRepository.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterOptionTypeAliasRecommendation: FfiConverterRustBuffer {
-    typealias SwiftType = AliasRecommendation?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeAliasRecommendation.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeAliasRecommendation.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -14900,30 +13827,6 @@ fileprivate struct FfiConverterOptionTypeFolder: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionTypeAliasFilter: FfiConverterRustBuffer {
-    typealias SwiftType = AliasFilter?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeAliasFilter.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeAliasFilter.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterOptionTypeLogLevel: FfiConverterRustBuffer {
     typealias SwiftType = LogLevel?
 
@@ -14940,30 +13843,6 @@ fileprivate struct FfiConverterOptionTypeLogLevel: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeLogLevel.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterOptionTypeOptionalSensitiveStringUpdate: FfiConverterRustBuffer {
-    typealias SwiftType = OptionalSensitiveStringUpdate?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeOptionalSensitiveStringUpdate.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeOptionalSensitiveStringUpdate.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -14996,30 +13875,6 @@ fileprivate struct FfiConverterOptionSequenceData: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionSequenceTypeMailboxId: FfiConverterRustBuffer {
-    typealias SwiftType = [MailboxId]?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterSequenceTypeMailboxId.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterSequenceTypeMailboxId.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterOptionTypeDateTime: FfiConverterRustBuffer {
     typealias SwiftType = DateTime?
 
@@ -15036,30 +13891,6 @@ fileprivate struct FfiConverterOptionTypeDateTime: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeDateTime.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterOptionTypeSensitiveString: FfiConverterRustBuffer {
-    typealias SwiftType = SensitiveString?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeSensitiveString.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeSensitiveString.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -15160,81 +13991,6 @@ fileprivate struct FfiConverterSequenceTypeAlias: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeAlias.read(from: &buf))
-        }
-        return seq
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterSequenceTypeAliasDomain: FfiConverterRustBuffer {
-    typealias SwiftType = [AliasDomain]
-
-    public static func write(_ value: [AliasDomain], into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        writeInt(&buf, len)
-        for item in value {
-            FfiConverterTypeAliasDomain.write(item, into: &buf)
-        }
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [AliasDomain] {
-        let len: Int32 = try readInt(&buf)
-        var seq = [AliasDomain]()
-        seq.reserveCapacity(Int(len))
-        for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeAliasDomain.read(from: &buf))
-        }
-        return seq
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterSequenceTypeCustomDomain: FfiConverterRustBuffer {
-    typealias SwiftType = [CustomDomain]
-
-    public static func write(_ value: [CustomDomain], into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        writeInt(&buf, len)
-        for item in value {
-            FfiConverterTypeCustomDomain.write(item, into: &buf)
-        }
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CustomDomain] {
-        let len: Int32 = try readInt(&buf)
-        var seq = [CustomDomain]()
-        seq.reserveCapacity(Int(len))
-        for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeCustomDomain.read(from: &buf))
-        }
-        return seq
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterSequenceTypeMailbox: FfiConverterRustBuffer {
-    typealias SwiftType = [Mailbox]
-
-    public static func write(_ value: [Mailbox], into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        writeInt(&buf, len)
-        for item in value {
-            FfiConverterTypeMailbox.write(item, into: &buf)
-        }
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Mailbox] {
-        let len: Int32 = try readInt(&buf)
-        var seq = [Mailbox]()
-        seq.reserveCapacity(Int(len))
-        for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeMailbox.read(from: &buf))
         }
         return seq
     }
@@ -15768,31 +14524,6 @@ fileprivate struct FfiConverterSequenceTypePasswordHistoryView: FfiConverterRust
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterSequenceTypeMailboxId: FfiConverterRustBuffer {
-    typealias SwiftType = [MailboxId]
-
-    public static func write(_ value: [MailboxId], into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        writeInt(&buf, len)
-        for item in value {
-            FfiConverterTypeMailboxId.write(item, into: &buf)
-        }
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MailboxId] {
-        let len: Int32 = try readInt(&buf)
-        var seq = [MailboxId]()
-        seq.reserveCapacity(Int(len))
-        for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeMailboxId.read(from: &buf))
-        }
-        return seq
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterSequenceTypeCollectionId: FfiConverterRustBuffer {
     typealias SwiftType = [CollectionId]
 
@@ -16205,7 +14936,7 @@ public func applyAliasReconciliation(plan: AliasReconciliationPlan, aliases: [Al
 })
 }
 /**
- * Binds a canonical current reference to a decrypted login cipher.
+ * Binds a canonical reference to a decrypted login cipher after username integrity validation.
  */
 public func bindAliasReference(value: SensitiveString, cipher: CipherView)throws  -> AliasCipherMutationResult  {
     return try  FfiConverterTypeAliasCipherMutationResult_lift(try rustCallWithError(FfiConverterTypeAliasReferenceError_lift) {
@@ -16216,18 +14947,48 @@ public func bindAliasReference(value: SensitiveString, cipher: CipherView)throws
 })
 }
 /**
- * Creates the canonical serialized current alias reference.
+ * Validates and deterministically orders an encrypted provider-neutral journal.
  */
-public func createAliasReference(identity: AliasProviderIdentity, alias: Alias)throws  -> SensitiveString  {
-    return try  FfiConverterTypeSensitiveString_lift(try rustCallWithError(FfiConverterTypeAliasReferenceError_lift) {
-    uniffi_bitwarden_uniffi_fn_func_create_alias_reference(
-        FfiConverterTypeAliasProviderIdentity_lower(identity),
-        FfiConverterTypeAlias_lower(alias),$0
+public func canonicalizeAliasJournal(journal: AliasJournal)throws  -> AliasJournal  {
+    return try  FfiConverterTypeAliasJournal_lift(try rustCallWithError(FfiConverterTypeAliasError_lift) {
+    uniffi_bitwarden_uniffi_fn_func_canonicalize_alias_journal(
+        FfiConverterTypeAliasJournal_lower(journal),$0
     )
 })
 }
 /**
- * Parses and validates a current alias reference without exposing its payload in errors.
+ * Clears a binding before save when the login username no longer matches its bound address.
+ */
+public func clearAliasReferenceIfUsernameChanged(cipher: CipherView)throws  -> AliasCipherMutationResult  {
+    return try  FfiConverterTypeAliasCipherMutationResult_lift(try rustCallWithError(FfiConverterTypeAliasReferenceError_lift) {
+    uniffi_bitwarden_uniffi_fn_func_clear_alias_reference_if_username_changed(
+        FfiConverterTypeCipherView_lower(cipher),$0
+    )
+})
+}
+/**
+ * Creates the canonical serialized v1 alias reference from neutral alias identity.
+ */
+public func createAliasReference(identity: AliasIdentity)throws  -> SensitiveString  {
+    return try  FfiConverterTypeSensitiveString_lift(try rustCallWithError(FfiConverterTypeAliasReferenceError_lift) {
+    uniffi_bitwarden_uniffi_fn_func_create_alias_reference(
+        FfiConverterTypeAliasIdentity_lower(identity),$0
+    )
+})
+}
+/**
+ * Pure set-union merge for two journals belonging to the same stable connection.
+ */
+public func mergeAliasJournals(left: AliasJournal, right: AliasJournal)throws  -> AliasJournal  {
+    return try  FfiConverterTypeAliasJournal_lift(try rustCallWithError(FfiConverterTypeAliasError_lift) {
+    uniffi_bitwarden_uniffi_fn_func_merge_alias_journals(
+        FfiConverterTypeAliasJournal_lower(left),
+        FfiConverterTypeAliasJournal_lower(right),$0
+    )
+})
+}
+/**
+ * Parses and validates a canonical v1 alias reference without exposing its payload in errors.
  */
 public func parseAliasReference(value: SensitiveString)throws  -> AliasReference  {
     return try  FfiConverterTypeAliasReference_lift(try rustCallWithError(FfiConverterTypeAliasReferenceError_lift) {
@@ -16237,14 +14998,24 @@ public func parseAliasReference(value: SensitiveString)throws  -> AliasReference
 })
 }
 /**
- * Computes a deterministic non-mutating reconciliation plan.
+ * Computes a deterministic, read-only reconciliation plan for one stable connection.
  */
-public func planAliasReconciliation(provider: AliasProviderIdentity, aliases: [Alias], ciphers: [CipherView])throws  -> AliasReconciliationPlan  {
+public func planAliasReconciliation(connectionId: String, aliases: [Alias], ciphers: [CipherView])throws  -> AliasReconciliationPlan  {
     return try  FfiConverterTypeAliasReconciliationPlan_lift(try rustCallWithError(FfiConverterTypeAliasReconciliationError_lift) {
     uniffi_bitwarden_uniffi_fn_func_plan_alias_reconciliation(
-        FfiConverterTypeAliasProviderIdentity_lower(provider),
+        FfiConverterString.lower(connectionId),
         FfiConverterSequenceTypeAlias.lower(aliases),
         FfiConverterSequenceTypeCipherView.lower(ciphers),$0
+    )
+})
+}
+/**
+ * Pure deterministic reduction of canonical journal facts into operation and resource state.
+ */
+public func reduceAliasJournal(journal: AliasJournal)throws  -> AliasJournalState  {
+    return try  FfiConverterTypeAliasJournalState_lift(try rustCallWithError(FfiConverterTypeAliasError_lift) {
+    uniffi_bitwarden_uniffi_fn_func_reduce_alias_journal(
+        FfiConverterTypeAliasJournal_lower(journal),$0
     )
 })
 }
@@ -16280,22 +15051,31 @@ private let initializationResult: InitializationResult = {
     if (uniffi_bitwarden_uniffi_checksum_func_apply_alias_reconciliation() != 37674) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_bitwarden_uniffi_checksum_func_bind_alias_reference() != 2931) {
+    if (uniffi_bitwarden_uniffi_checksum_func_bind_alias_reference() != 36899) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_bitwarden_uniffi_checksum_func_create_alias_reference() != 42735) {
+    if (uniffi_bitwarden_uniffi_checksum_func_canonicalize_alias_journal() != 62339) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_bitwarden_uniffi_checksum_func_parse_alias_reference() != 34176) {
+    if (uniffi_bitwarden_uniffi_checksum_func_clear_alias_reference_if_username_changed() != 32733) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_bitwarden_uniffi_checksum_func_plan_alias_reconciliation() != 59164) {
+    if (uniffi_bitwarden_uniffi_checksum_func_create_alias_reference() != 43921) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_uniffi_checksum_func_merge_alias_journals() != 32111) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_uniffi_checksum_func_parse_alias_reference() != 21484) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_uniffi_checksum_func_plan_alias_reconciliation() != 48567) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_uniffi_checksum_func_reduce_alias_journal() != 61647) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_bitwarden_uniffi_checksum_func_serialize_alias_reference() != 18018) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_client_aliases() != 64025) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_bitwarden_uniffi_checksum_method_client_auth() != 21774) {
@@ -16347,78 +15127,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_bitwarden_uniffi_checksum_method_client_vault() != 35701) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_create_alias_reference() != 41969) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_create_contact() != 52722) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_create_custom_alias() != 51001) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_create_random_alias() != 7163) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_create_reverse_alias() != 14394) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_delete_alias() != 32308) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_delete_contact() != 41680) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_disable_alias() != 55784) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_enable_alias() != 17723) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_get_alias() != 29570) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_get_alias_options() != 51205) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_get_alias_recommendation() != 6374) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_list_aliases() != 59505) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_list_contacts() != 49874) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_list_custom_domains() != 12178) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_list_domains() != 48745) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_list_mailboxes() != 39319) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_list_reverse_aliases() != 49863) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_provider_identity() != 20276) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_search_aliases() != 43228) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_set_alias_enabled() != 19608) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_toggle_contact_blocked() != 59432) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_update_alias() != 36177) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_method_aliasclient_update_custom_domain() != 20198) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_bitwarden_uniffi_checksum_method_authclient_approve_auth_request() != 61224) {
@@ -16974,9 +15682,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_bitwarden_uniffi_checksum_constructor_client_new() != 46660) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_bitwarden_uniffi_checksum_constructor_aliasclient_new() != 60155) {
         return InitializationResult.apiChecksumMismatch
     }
 

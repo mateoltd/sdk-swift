@@ -885,131 +885,6 @@ public func FfiConverterTypeAppendType_lower(_ value: AppendType) -> RustBuffer 
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * Configures the email forwarding service to use.
- * For instructions on how to configure each service, see the documentation:
- * <https://bitwarden.com/help/generator/#username-types>
- */
-
-public enum ForwarderServiceType: Equatable, Hashable {
-    
-    /**
-     * Previously known as "AnonAddy"
-     */
-    case addyIo(apiToken: String, domain: String, baseUrl: String
-    )
-    case duckDuckGo(token: String
-    )
-    case firefox(apiToken: String
-    )
-    case fastmail(apiToken: String
-    )
-    case forwardEmail(apiToken: String, domain: String
-    )
-    case simpleLogin(apiKey: String, baseUrl: String
-    )
-
-
-
-
-
-}
-
-#if compiler(>=6)
-extension ForwarderServiceType: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeForwarderServiceType: FfiConverterRustBuffer {
-    typealias SwiftType = ForwarderServiceType
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ForwarderServiceType {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-        
-        case 1: return .addyIo(apiToken: try FfiConverterString.read(from: &buf), domain: try FfiConverterString.read(from: &buf), baseUrl: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 2: return .duckDuckGo(token: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 3: return .firefox(apiToken: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 4: return .fastmail(apiToken: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 5: return .forwardEmail(apiToken: try FfiConverterString.read(from: &buf), domain: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 6: return .simpleLogin(apiKey: try FfiConverterString.read(from: &buf), baseUrl: try FfiConverterString.read(from: &buf)
-        )
-        
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: ForwarderServiceType, into buf: inout [UInt8]) {
-        switch value {
-        
-        
-        case let .addyIo(apiToken,domain,baseUrl):
-            writeInt(&buf, Int32(1))
-            FfiConverterString.write(apiToken, into: &buf)
-            FfiConverterString.write(domain, into: &buf)
-            FfiConverterString.write(baseUrl, into: &buf)
-            
-        
-        case let .duckDuckGo(token):
-            writeInt(&buf, Int32(2))
-            FfiConverterString.write(token, into: &buf)
-            
-        
-        case let .firefox(apiToken):
-            writeInt(&buf, Int32(3))
-            FfiConverterString.write(apiToken, into: &buf)
-            
-        
-        case let .fastmail(apiToken):
-            writeInt(&buf, Int32(4))
-            FfiConverterString.write(apiToken, into: &buf)
-            
-        
-        case let .forwardEmail(apiToken,domain):
-            writeInt(&buf, Int32(5))
-            FfiConverterString.write(apiToken, into: &buf)
-            FfiConverterString.write(domain, into: &buf)
-            
-        
-        case let .simpleLogin(apiKey,baseUrl):
-            writeInt(&buf, Int32(6))
-            FfiConverterString.write(apiKey, into: &buf)
-            FfiConverterString.write(baseUrl, into: &buf)
-            
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeForwarderServiceType_lift(_ buf: RustBuffer) throws -> ForwarderServiceType {
-    return try FfiConverterTypeForwarderServiceType.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeForwarderServiceType_lower(_ value: ForwarderServiceType) -> RustBuffer {
-    return FfiConverterTypeForwarderServiceType.lower(value)
-}
-
-
 
 public enum PassphraseError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
@@ -1266,13 +1141,7 @@ public enum UsernameError: Swift.Error, Equatable, Hashable, Foundation.Localize
 
     
     
-    case InvalidApiKey(message: String)
-    
-    case Unknown(message: String)
-    
-    case ResponseContent(message: String)
-    
-    case Reqwest(message: String)
+    case GenerationFailed(message: String)
     
 
     
@@ -1303,19 +1172,7 @@ public struct FfiConverterTypeUsernameError: FfiConverterRustBuffer {
         
 
         
-        case 1: return .InvalidApiKey(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 2: return .Unknown(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 3: return .ResponseContent(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 4: return .Reqwest(
+        case 1: return .GenerationFailed(
             message: try FfiConverterString.read(from: &buf)
         )
         
@@ -1330,14 +1187,8 @@ public struct FfiConverterTypeUsernameError: FfiConverterRustBuffer {
         
 
         
-        case .InvalidApiKey(_ /* message is ignored*/):
+        case .GenerationFailed(_ /* message is ignored*/):
             writeInt(&buf, Int32(1))
-        case .Unknown(_ /* message is ignored*/):
-            writeInt(&buf, Int32(2))
-        case .ResponseContent(_ /* message is ignored*/):
-            writeInt(&buf, Int32(3))
-        case .Reqwest(_ /* message is ignored*/):
-            writeInt(&buf, Int32(4))
 
         
         }
@@ -1396,16 +1247,6 @@ public enum UsernameGeneratorRequest: Equatable, Hashable {
          * The domain to use for the catchall email address
          */domain: String
     )
-    case forwarded(
-        /**
-         * The email forwarding service to use, see [ForwarderServiceType]
-         * for instructions on how to configure each
-         */service: ForwarderServiceType, 
-        /**
-         * The website for which the email address is being generated
-         * This is not used in all services, and is only used for display purposes
-         */website: String?
-    )
 
 
 
@@ -1436,9 +1277,6 @@ public struct FfiConverterTypeUsernameGeneratorRequest: FfiConverterRustBuffer {
         case 3: return .catchall(type: try FfiConverterTypeAppendType.read(from: &buf), domain: try FfiConverterString.read(from: &buf)
         )
         
-        case 4: return .forwarded(service: try FfiConverterTypeForwarderServiceType.read(from: &buf), website: try FfiConverterOptionString.read(from: &buf)
-        )
-        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -1463,12 +1301,6 @@ public struct FfiConverterTypeUsernameGeneratorRequest: FfiConverterRustBuffer {
             writeInt(&buf, Int32(3))
             FfiConverterTypeAppendType.write(type, into: &buf)
             FfiConverterString.write(domain, into: &buf)
-            
-        
-        case let .forwarded(service,website):
-            writeInt(&buf, Int32(4))
-            FfiConverterTypeForwarderServiceType.write(service, into: &buf)
-            FfiConverterOptionString.write(website, into: &buf)
             
         }
     }

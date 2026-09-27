@@ -4,7 +4,7 @@
   "packageVersion": "0.3.0-alias-provider-neutral.2",
   "sourceRepository": "https://github.com/mateoltd/bitwarden-sdk-internal",
   "sourceBranch": "integration/alias-sdk-launch-20260926",
-  "sourceCommit": "c15eaaa348846f137b8ee4cc98e86a885b1ff122",
+  "sourceCommit": "e95fcbfda75603c55558926407ac7ea40a5aa762",
   "integrationBaseCommit": "167d44eca79020334618607f53f1db366f70ffe4",
   "build": {
     "kind": "local-native",
@@ -19,12 +19,12 @@
       "aarch64-apple-ios-sim"
     ],
     "generator": "uniffi-bindgen from the same source, UniFFI 0.32.0",
-    "nativeBuildDriverSha256": "dbcebe5db1367887daa5e8e069fc016886f2408ced6d7911cf9052917c208788"
+    "nativeBuildDriverSha256": "13732cd5e8ba23a2fab56209bcd8b3453050b569eea716798e34bbeb6b667564"
   },
   "binaryDistribution": {
     "path": "BitwardenFFI.xcframework.zip",
-    "bytes": 104605961,
-    "sha256": "1fd23fc79b743ccfb55bb4ceeb35b5c97b2116166e9fb5057be12126b37ca582",
+    "bytes": 104606549,
+    "sha256": "35c222fe718bfcc4af127789965dea93364c1c3f42a6f050a1997bb7eac0b575",
     "normalized": true,
     "transformations": [
       "strip debug and local symbols with Apple strip -S -x",
@@ -69,7 +69,7 @@
       "BitwardenFFI.xcframework/ios-arm64-simulator/Headers/BitwardenUserCryptoManagementFFI.h": "51d07ab8c17351adef66e40570c858cca688a1614622d7518bd3d35d8a263cc7",
       "BitwardenFFI.xcframework/ios-arm64-simulator/Headers/BitwardenVaultFFI.h": "fb54edc475199d4a8a34c2a3ccc98fce5c3a8f0cfaba1fca270d7bccaab0d591",
       "BitwardenFFI.xcframework/ios-arm64-simulator/Headers/module.modulemap": "b30cebd1b80c8611352418bfd54f9d25617f924c72b1d221bf0e61b80728bbd8",
-      "BitwardenFFI.xcframework/ios-arm64-simulator/libbitwarden_uniffi.a": "72c06d6b6b3d1892d6439401c829d0540540e947b1ad6de2baa8f9b3066eb0de",
+      "BitwardenFFI.xcframework/ios-arm64-simulator/libbitwarden_uniffi.a": "11e3ae29d3b97f1af4a53e50313a8c1beb46a215ee7c59d0150b144f006d7bd6",
       "BitwardenFFI.xcframework/ios-arm64/Headers/BitwardenAliasFFI.h": "04d76e90985ee0097a83e0d96bb9fc15316879d57c6d387c889cbe06ba5a3143",
       "BitwardenFFI.xcframework/ios-arm64/Headers/BitwardenApiBaseFFI.h": "e35ec39058dd254423522f4257aa1016fc5e212c427a484b733104eb591092dc",
       "BitwardenFFI.xcframework/ios-arm64/Headers/BitwardenAuthFFI.h": "06422baf19db2b817703d0c1c050975a881a27d5cf2b35fd9c40a0ed89244f37",
@@ -97,7 +97,7 @@
       "BitwardenFFI.xcframework/ios-arm64/Headers/BitwardenUserCryptoManagementFFI.h": "51d07ab8c17351adef66e40570c858cca688a1614622d7518bd3d35d8a263cc7",
       "BitwardenFFI.xcframework/ios-arm64/Headers/BitwardenVaultFFI.h": "fb54edc475199d4a8a34c2a3ccc98fce5c3a8f0cfaba1fca270d7bccaab0d591",
       "BitwardenFFI.xcframework/ios-arm64/Headers/module.modulemap": "b30cebd1b80c8611352418bfd54f9d25617f924c72b1d221bf0e61b80728bbd8",
-      "BitwardenFFI.xcframework/ios-arm64/libbitwarden_uniffi.a": "fcb76d5e09abd79a9e2681b49110b54261a4b748322946cb41bde5163d6ecf84"
+      "BitwardenFFI.xcframework/ios-arm64/libbitwarden_uniffi.a": "ac1385610756b3551da8c9c953902e047a938edb5eadb14f0e119be98f0aefe0"
     }
   },
   "generatedSourceHashes": {
@@ -130,10 +130,15 @@
     "Sources/BitwardenSdkSupport/NaiveDateFormatter.swift": "157610fe70ca53028be7cebd4f74292e4c64d28caf67b12ebf17d11013bed9ae"
   },
   "nativeBuildHashes": {
-    "aarch64-apple-ios/libbitwarden_uniffi.a": "ca11e1011cb6603708dd47293709ea6a7f780900c32fdd0ef23c056476ed2204",
-    "aarch64-apple-ios/libbitwarden_uniffi.dylib": "609fd49a51081927375b88d94a2c60b09720cf023af44d358328577c51e4c482",
-    "aarch64-apple-ios-sim/libbitwarden_uniffi.a": "ef5643c93a42bcd534fba0ab83828fa83ab53d2a65436c10365bcfa09d023c23",
-    "aarch64-apple-ios-sim/libbitwarden_uniffi.dylib": "7c71d4b0717f07d9ea76bb1149fa1cc9a679b1008c743756c05f528ffdd351ce"
+    "aarch64-apple-ios/libbitwarden_uniffi.a": "bf29d269415fa08ed3a6344a9b7722b8f1bf00360143594cf022bab1b63d68d7",
+    "aarch64-apple-ios/libbitwarden_uniffi.dylib": "a25d26e2243809ece571dc7b54f5487be3cc960de0307876a83e884b9b79974e",
+    "aarch64-apple-ios-sim/libbitwarden_uniffi.a": "081a179cb8703f2307fda7100907ac36b24713a13b5d17f8a66183ed8c607a1c",
+    "aarch64-apple-ios-sim/libbitwarden_uniffi.dylib": "7a539c87fc678f19b96e4d83a65469c18038280d5321767767f34f77475889d7"
+  },
+  "dependencyLock": {
+    "sha256": "b607566039f571b3d20925efe8ad83070b04c6df40afc2cea46ae953aa339d14",
+    "rustls": "0.23.45",
+    "rustls-webpki": "0.103.15"
   },
   "checks": {
     "ossInputBoundary": "passed",
@@ -141,20 +146,22 @@
     "swiftConsumerArm64Simulator": "passed",
     "swiftConsumerUnsignedArm64Device": "passed",
     "packageRuntimeTests": {
+      "binary": "extracted from the exact distribution archive",
       "passed": 6,
       "failed": 0,
       "runtime": "iOS 26.5",
       "device": "iPhone 17 Pro"
     },
     "logSha256": {
-      "sdk-arm64-simulator.log": "2435040abe5c00e8ee9e638e450539a06d4d23139562e4356c3b256eb9a34705",
-      "sdk-arm64-device.log": "e77eb9a94fb26f9f09f9aeb56d2f717f99a1c7909084d06ad6eb160e32994158",
-      "sdk-bindings.log": "03184a16c01269704f27240f6d8ad2df43098eb8455e036da1ddd5320d42121e",
-      "sdk-oss-input.log": "ca40ef7c05b17f5398b3d9818deb47d96382816e12a26b8856bfeee154c8d342",
+      "sdk-arm64-simulator.log": "eaa7caf4eb0ccdb98bc6f321bdc5ced22084fd3c2c1d409295066e5d2bd2fdf7",
+      "sdk-arm64-device.log": "0e0a4ab15fc30dc7118f7e5d22914276b1d81dfc16e33071170ef95a5f0c7ee5",
+      "sdk-bindings.log": "c6bcb95a29c83050bd0076d574e310440967dad1d05e7b4d7d4caf0c63188e83",
+      "sdk-oss-input.log": "cfe76b3edbf13566a5517c90b9fcc4841b2a8547780de84be8faf89eae982485",
       "sdk-oss-output.log": "e966a63c9aae65a86ca8d5569f3af6db00ca4d4af261bb9895fbce5d7818faa9",
-      "consumer-simulator.log": "1302b852c958bd1d4c9082c7e79f60d44d1d00898ffbd252b7a3e0452e909b8e",
-      "consumer-device.log": "68fbf4cb69dbbc2c7ecc9d0caea943b37279a5f6a923090c4a888ebd8a6ef2f3",
-      "sdk-tests.log": "28f01ebda9964596758b32c500b26cef2574de715c452bccf72fddb8abe779ed"
+      "consumer-simulator.log": "7afda90adafb6b6bcf8ca7d29d5e9114aaf0119c3689e168b4c7a67aa00847eb",
+      "consumer-device.log": "af66be47c7fefe894b7d5927343bddd0cee8230fdfd47421925eb33fbb63cc64",
+      "sdk-tests.log": "22367a491c1640d42a8751b1e9a8247d62f91d8164752f45ac2954fb9db0f455",
+      "sdk-distribution-tests.log": "57e7157a27c81122b03c584e3269c28f8d43872093a938dd7b2abb1ab5ef170f"
     }
   }
 }

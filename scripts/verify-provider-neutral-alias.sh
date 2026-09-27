@@ -10,7 +10,7 @@ if (( $# > 1 )); then
     exit 2
 fi
 
-for command_name in cmp comm diff git jq lipo nm plutil rg shasum stat swift tar unzip zipinfo; do
+for command_name in cmp comm diff git jq lipo nm plutil python3 rg shasum stat swift tar unzip zipinfo; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "Provider-neutral alias verification failed: missing $command_name" >&2
         exit 1
@@ -131,6 +131,23 @@ distribution_sha256="$(git show "$distribution_commit:$binary_path" | shasum -a 
     || fail "binary URL commit does not contain the verified archive"
 
 swift package dump-package >/dev/null
+
+# Verify the exact generated inputs and every distributed file, including FFI headers.
+python3 - <<'PYVERIFY'
+from pathlib import Path
+import hashlib, json, zipfile
+provenance = json.loads(Path("ALIAS_SDK_PROVENANCE.json").read_text())
+expected_sources = provenance["generatedSourceHashes"]
+actual_sources = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in Path("Sources").rglob("*.swift")}
+if actual_sources != expected_sources:
+    raise SystemExit("Generated Swift/support source hashes differ from provenance")
+with zipfile.ZipFile("BitwardenFFI.xcframework.zip") as archive:
+    actual_entries = {name: hashlib.sha256(archive.read(name)).hexdigest()
+                      for name in archive.namelist()}
+if actual_entries != provenance["binaryDistribution"]["entrySha256"]:
+    raise SystemExit("Distributed library/header hashes differ from provenance")
+PYVERIFY
 
 temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/bitwarden-alias-verify.XXXXXX")"
 trap 'rm -rf "$temporary_directory"' EXIT

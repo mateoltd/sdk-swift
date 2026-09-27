@@ -3,6 +3,8 @@
 
 // swiftlint:disable all
 import Foundation
+import BitwardenSdkSupport
+import Foundation
 
 // Depending on the consumer's build setup, the low-level FFI code
 // might be in a separate module, or it might be compiled inline into
@@ -38,6 +40,52 @@ fileprivate extension RustBuffer {
 fileprivate extension ForeignBytes {
     init(bufferPointer: UnsafeBufferPointer<UInt8>) {
         self.init(len: Int32(bufferPointer.count), data: bufferPointer.baseAddress)
+    }
+
+    init(rawBufferPointer: UnsafeRawBufferPointer) {
+        self.init(
+            len: Int32(rawBufferPointer.count),
+            data: rawBufferPointer.baseAddress?.assumingMemoryBound(to: UInt8.self)
+        )
+    }
+}
+
+// Converter for `&[u8]` / `[ByRef] bytes` arguments.
+//
+// Conforms to `FfiConverter` so the compiler enforces the full converter
+// method set. Only the scope-bound `lower(_:_body:)` overload is sound —
+// zero-copy byte buffers only flow foreign -> Rust, and only in argument
+// position. The four protocol-witness methods (`lift`, `lower`, `read`,
+// `write`) `fatalError` at runtime if anyone reaches them.
+//
+// The scope-bound `lower` takes a closure because the `ForeignBytes`
+// pointer is only guaranteed valid for the duration of
+// `Data.withUnsafeBytes`. Callers must run the full FFI call inside
+// the closure body.
+fileprivate enum FfiConverterByRefBytes: FfiConverter {
+    typealias SwiftType = Data
+    typealias FfiType = ForeignBytes
+
+    static func lower<R>(_ value: Data, _ body: (ForeignBytes) throws -> R) rethrows -> R {
+        return try value.withUnsafeBytes { rawBuf in
+            try body(ForeignBytes(rawBufferPointer: rawBuf))
+        }
+    }
+
+    static func lower(_ value: Data) -> ForeignBytes {
+        fatalError("ByRef bytes cannot use the plain lower: returning ForeignBytes escapes the Data.withUnsafeBytes scope. Use the scope-bound lower(_:_body:) overload instead.")
+    }
+
+    static func lift(_ value: ForeignBytes) throws -> Data {
+        fatalError("ByRef bytes cannot be lifted: zero-copy &[u8] only flows foreign->Rust")
+    }
+
+    static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
+        fatalError("ByRef bytes cannot be read from a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+    }
+
+    static func write(_ value: Data, into buf: inout [UInt8]) {
+        fatalError("ByRef bytes cannot be written to a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
     }
 }
 
@@ -170,10 +218,16 @@ fileprivate protocol FfiConverter {
 fileprivate protocol FfiConverterPrimitive: FfiConverter where FfiType == SwiftType { }
 
 extension FfiConverterPrimitive {
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
     public static func lift(_ value: FfiType) throws -> SwiftType {
         return value
     }
 
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
     public static func lower(_ value: SwiftType) -> FfiType {
         return value
     }
@@ -184,6 +238,9 @@ extension FfiConverterPrimitive {
 fileprivate protocol FfiConverterRustBuffer: FfiConverter where FfiType == RustBuffer {}
 
 extension FfiConverterRustBuffer {
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
     public static func lift(_ buf: RustBuffer) throws -> SwiftType {
         var reader = createReader(data: Data(rustBuffer: buf))
         let value = try read(from: &reader)
@@ -194,6 +251,9 @@ extension FfiConverterRustBuffer {
         return value
     }
 
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
     public static func lower(_ value: SwiftType) -> RustBuffer {
           var writer = createWriter()
           write(value, into: &writer)
@@ -269,7 +329,7 @@ private func makeRustCall<T, E: Swift.Error>(
     _ callback: (UnsafeMutablePointer<RustCallStatus>) -> T,
     errorHandler: ((RustBuffer) throws -> E)?
 ) throws -> T {
-    uniffiEnsureInitialized()
+    uniffiEnsureBitwardenCoreInitialized()
     var callStatus = RustCallStatus.init()
     let returnedVal = callback(&callStatus)
     try uniffiCheckCallStatus(callStatus: callStatus, errorHandler: errorHandler)
@@ -340,18 +400,29 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
         callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
     }
 }
-fileprivate class UniffiHandleMap<T> {
-    private var map: [UInt64: T] = [:]
+// Initial value and increment amount for handles. 
+// These ensure that SWIFT handles always have the lowest bit set
+fileprivate let UNIFFI_HANDLEMAP_INITIAL: UInt64 = 1
+fileprivate let UNIFFI_HANDLEMAP_DELTA: UInt64 = 2
+
+fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
+    // All mutation happens with this lock held, which is why we implement @unchecked Sendable.
     private let lock = NSLock()
-    private var currentHandle: UInt64 = 1
+    private var map: [UInt64: T] = [:]
+    private var currentHandle: UInt64 = UNIFFI_HANDLEMAP_INITIAL
 
     func insert(obj: T) -> UInt64 {
         lock.withLock {
-            let handle = currentHandle
-            currentHandle += 1
-            map[handle] = obj
-            return handle
+            return doInsert(obj)
         }
+    }
+
+    // Low-level insert function, this assumes `lock` is held.
+    private func doInsert(_ obj: T) -> UInt64 {
+        let handle = currentHandle
+        currentHandle += UNIFFI_HANDLEMAP_DELTA
+        map[handle] = obj
+        return handle
     }
 
      func get(handle: UInt64) throws -> T {
@@ -360,6 +431,15 @@ fileprivate class UniffiHandleMap<T> {
                 throw UniffiInternalError.unexpectedStaleHandle
             }
             return obj
+        }
+    }
+
+     func clone(handle: UInt64) throws -> UInt64 {
+        try lock.withLock {
+            guard let obj = map[handle] else {
+                throw UniffiInternalError.unexpectedStaleHandle
+            }
+            return doInsert(obj)
         }
     }
 
@@ -382,8 +462,17 @@ fileprivate class UniffiHandleMap<T> {
 
 
 // Public interface members begin here.
+// Magic number for the Rust proxy to call using the same mechanism as every other method,
+// to free the callback once it's dropped by Rust.
+private let IDX_CALLBACK_FREE: Int32 = 0
+// Callback return codes
+private let UNIFFI_CALLBACK_SUCCESS: Int32 = 0
+private let UNIFFI_CALLBACK_ERROR: Int32 = 1
+private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
 
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
     typealias FfiType = UInt8
     typealias SwiftType = UInt8
@@ -397,6 +486,25 @@ fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
+    typealias FfiType = UInt64
+    typealias SwiftType = UInt64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -418,6 +526,9 @@ fileprivate struct FfiConverterBool : FfiConverter {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterString: FfiConverter {
     typealias SwiftType = String
     typealias FfiType = RustBuffer
@@ -430,7 +541,11 @@ fileprivate struct FfiConverterString: FfiConverter {
             return String()
         }
         let bytes = UnsafeBufferPointer<UInt8>(start: value.data!, count: Int(value.len))
-        return String(bytes: bytes, encoding: String.Encoding.utf8)!
+        // Use Swift's native UTF-8 decoder; `String(bytes:encoding:.utf8)` goes
+        // through Foundation's NSString and silently strips a leading U+FEFF BOM.
+        // Invalid UTF-8 substitutes U+FFFD instead of trapping (unreachable
+        // given Rust's `String` invariant).
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     public static func lower(_ value: String) -> RustBuffer {
@@ -446,7 +561,8 @@ fileprivate struct FfiConverterString: FfiConverter {
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> String {
         let len: Int32 = try readInt(&buf)
-        return String(bytes: try readBytes(&buf, count: Int(len)), encoding: String.Encoding.utf8)!
+        // See `lift` above for why we avoid Foundation's NSString-backed decoder here.
+        return String(decoding: try readBytes(&buf, count: Int(len)), as: UTF8.self)
     }
 
     public static func write(_ value: String, into buf: inout [UInt8]) {
@@ -456,18 +572,26 @@ fileprivate struct FfiConverterString: FfiConverter {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterTimestamp: FfiConverterRustBuffer {
     typealias SwiftType = Date
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Date {
         let seconds: Int64 = try readInt(&buf)
         let nanoseconds: UInt32 = try readInt(&buf)
+        // Build the Date from whole seconds first, then add the nanoseconds as a
+        // separate TimeInterval.  Date stores CFAbsoluteTime (seconds since 2001),
+        // so adding a small fraction to the ~7.8e8 base is twice as precise as
+        // adding it to the ~1.76e9 Unix-epoch value, because the smaller magnitude
+        // leaves more mantissa bits for the sub-second part.
         if seconds >= 0 {
-            let delta = Double(seconds) + (Double(nanoseconds) / 1.0e9)
-            return Date.init(timeIntervalSince1970: delta)
+            return Date(timeIntervalSince1970: Double(seconds))
+                .addingTimeInterval(Double(nanoseconds) / 1.0e9)
         } else {
-            let delta = Double(seconds) - (Double(nanoseconds) / 1.0e9)
-            return Date.init(timeIntervalSince1970: delta)
+            return Date(timeIntervalSince1970: Double(seconds))
+                .addingTimeInterval(-Double(nanoseconds) / 1.0e9)
         }
     }
 
@@ -492,16 +616,2684 @@ fileprivate struct FfiConverterTimestamp: FfiConverterRustBuffer {
 }
 
 
-public struct AuthRequestResponse {
+
+
+/**
+ * Access tokens managed by client applications, such as the web or mobile apps.
+ */
+public protocol ClientManagedTokens: AnyObject, Sendable {
+    
+    /**
+     * Returns the access token, if available.
+     */
+    func getAccessToken() async  -> String?
+    
+}
+/**
+ * Access tokens managed by client applications, such as the web or mobile apps.
+ */
+open class ClientManagedTokensImpl: ClientManagedTokens, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_bitwarden_core_fn_clone_clientmanagedtokens(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_bitwarden_core_fn_free_clientmanagedtokens(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Returns the access token, if available.
+     */
+open func getAccessToken()async  -> String?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_clientmanagedtokens_get_access_token(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_bitwarden_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+
+    
+}
+
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceClientManagedTokens {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceClientManagedTokens = UniffiVTableCallbackInterfaceClientManagedTokens(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterTypeClientManagedTokens.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface ClientManagedTokens: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterTypeClientManagedTokens.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface ClientManagedTokens: handle missing in uniffiClone")
+            }
+        },
+        getAccessToken: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> String? in
+                guard let uniffiObj = try? FfiConverterTypeClientManagedTokens.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.getAccessToken(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: String?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionString.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceClientManagedTokens> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceClientManagedTokens>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitClientManagedTokens() {
+    uniffi_bitwarden_core_fn_init_callback_vtable_clientmanagedtokens(UniffiCallbackInterfaceClientManagedTokens.vtablePtr)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeClientManagedTokens: FfiConverter {
+    fileprivate static let handleMap = UniffiHandleMap<ClientManagedTokens>()
+
+    typealias FfiType = UInt64
+    typealias SwiftType = ClientManagedTokens
+
+    public static func lift(_ handle: UInt64) throws -> ClientManagedTokens {
+        if ((handle & 1) == 0) {
+            // Rust-generated handle, construct a new class that uses the handle to implement the
+            // interface
+            return ClientManagedTokensImpl(unsafeFromHandle: handle)
+        } else {
+            // Swift-generated handle, get the object from the handle map
+            return try handleMap.remove(handle: handle)
+        }
+    }
+
+    public static func lower(_ value: ClientManagedTokens) -> UInt64 {
+         if let rustImpl = value as? ClientManagedTokensImpl {
+             // Rust-implemented object.  Clone the handle and return it
+            return rustImpl.uniffiCloneHandle()
+         } else {
+            // Swift object, generate a new vtable handle and return that.
+            return handleMap.insert(obj: value)
+         }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ClientManagedTokens {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: ClientManagedTokens, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeClientManagedTokens_lift(_ handle: UInt64) throws -> ClientManagedTokens {
+    return try FfiConverterTypeClientManagedTokens.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeClientManagedTokens_lower(_ value: ClientManagedTokens) -> UInt64 {
+    return FfiConverterTypeClientManagedTokens.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Client for interacting with the key-management state bridge. This is used to read and write
+ * state held by the clients
+ */
+public protocol StateBridgeClientProtocol: AnyObject, Sendable {
+    
+    /**
+     * Registers the host-supplied state bridge implementation.
+     */
+    func registerBridgeImpl(bridgeImpl: StateBridgeForeignImpl) 
+    
+}
+/**
+ * Client for interacting with the key-management state bridge. This is used to read and write
+ * state held by the clients
+ */
+open class StateBridgeClient: StateBridgeClientProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_bitwarden_core_fn_clone_statebridgeclient(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_bitwarden_core_fn_free_statebridgeclient(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Registers the host-supplied state bridge implementation.
+     */
+open func registerBridgeImpl(bridgeImpl: StateBridgeForeignImpl)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_bitwarden_core_fn_method_statebridgeclient_register_bridge_impl(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeStateBridgeForeignImpl_lower(bridgeImpl),uniffiCallStatus
+    )
+}
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStateBridgeClient: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = StateBridgeClient
+
+    public static func lift(_ handle: UInt64) throws -> StateBridgeClient {
+        return StateBridgeClient(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: StateBridgeClient) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StateBridgeClient {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: StateBridgeClient, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStateBridgeClient_lift(_ handle: UInt64) throws -> StateBridgeClient {
+    return try FfiConverterTypeStateBridgeClient.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStateBridgeClient_lower(_ value: StateBridgeClient) -> UInt64 {
+    return FfiConverterTypeStateBridgeClient.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Foreign trait that Swift/Kotlin hosts implement to provide the state bridge.
+ *
+ * `StateBridgeImpl` is automatically implemented for the
+ * `UniffiStateBridge` adapter that wraps an
+ * `Arc<dyn StateBridgeForeignImpl>`.
+ */
+public protocol StateBridgeForeignImpl: AnyObject, Sendable {
+    
+    /**
+     * Stores the `user_key` value.
+     */
+    func setUserKey(value: SymmetricCryptoKey) async 
+    
+    /**
+     * Returns the `user_key` value, if available.
+     */
+    func getUserKey() async  -> SymmetricCryptoKey?
+    
+    /**
+     * Clears the `user_key` value.
+     */
+    func clearUserKey() async 
+    
+    /**
+     * Stores the `user_key_id` value.
+     */
+    func setUserKeyId(value: KeyId) async 
+    
+    /**
+     * Returns the `user_key_id` value, if available.
+     */
+    func getUserKeyId() async  -> KeyId?
+    
+    /**
+     * Clears the `user_key_id` value.
+     */
+    func clearUserKeyId() async 
+    
+    /**
+     * Stores the `persistent_pin_envelope` value.
+     */
+    func setPersistentPinEnvelope(value: PasswordProtectedKeyEnvelope) async 
+    
+    /**
+     * Returns the `persistent_pin_envelope` value, if available.
+     */
+    func getPersistentPinEnvelope() async  -> PasswordProtectedKeyEnvelope?
+    
+    /**
+     * Clears the `persistent_pin_envelope` value.
+     */
+    func clearPersistentPinEnvelope() async 
+    
+    /**
+     * Stores the `ephemeral_pin_envelope` value.
+     */
+    func setEphemeralPinEnvelope(value: PasswordProtectedKeyEnvelope) async 
+    
+    /**
+     * Returns the `ephemeral_pin_envelope` value, if available.
+     */
+    func getEphemeralPinEnvelope() async  -> PasswordProtectedKeyEnvelope?
+    
+    /**
+     * Clears the `ephemeral_pin_envelope` value.
+     */
+    func clearEphemeralPinEnvelope() async 
+    
+    /**
+     * Stores the `encrypted_pin` value.
+     */
+    func setEncryptedPin(value: EncString) async 
+    
+    /**
+     * Returns the `encrypted_pin` value, if available.
+     */
+    func getEncryptedPin() async  -> EncString?
+    
+    /**
+     * Clears the `encrypted_pin` value.
+     */
+    func clearEncryptedPin() async 
+    
+    /**
+     * Stores the `v2_upgrade_token` value.
+     */
+    func setV2UpgradeToken(value: V2UpgradeToken) async 
+    
+    /**
+     * Returns the `v2_upgrade_token` value, if available.
+     */
+    func getV2UpgradeToken() async  -> V2UpgradeToken?
+    
+    /**
+     * Clears the `v2_upgrade_token` value.
+     */
+    func clearV2UpgradeToken() async 
+    
+    /**
+     * Stores the `account_cryptographic_state` value.
+     */
+    func setAccountCryptographicState(value: WrappedAccountCryptographicState) async 
+    
+    /**
+     * Returns the `account_cryptographic_state` value, if available.
+     */
+    func getAccountCryptographicState() async  -> WrappedAccountCryptographicState?
+    
+    /**
+     * Clears the `account_cryptographic_state` value.
+     */
+    func clearAccountCryptographicState() async 
+    
+    /**
+     * Stores the `masterpassword_unlock_data` value.
+     */
+    func setMasterpasswordUnlockData(value: MasterPasswordUnlockData) async 
+    
+    /**
+     * Returns the `masterpassword_unlock_data` value, if available.
+     */
+    func getMasterpasswordUnlockData() async  -> MasterPasswordUnlockData?
+    
+    /**
+     * Clears the `masterpassword_unlock_data` value.
+     */
+    func clearMasterpasswordUnlockData() async 
+    
+    /**
+     * Stores the `webauthn_prf_unlock_data` value.
+     */
+    func setWebauthnPrfUnlockData(value: WebAuthnPrfUnlockData) async 
+    
+    /**
+     * Returns the `webauthn_prf_unlock_data` value, if available.
+     */
+    func getWebauthnPrfUnlockData() async  -> WebAuthnPrfUnlockData?
+    
+    /**
+     * Clears the `webauthn_prf_unlock_data` value.
+     */
+    func clearWebauthnPrfUnlockData() async 
+    
+    /**
+     * Stores the `kdf_config` value.
+     */
+    func setKdfConfig(value: Kdf) async 
+    
+    /**
+     * Returns the `kdf_config` value, if available.
+     */
+    func getKdfConfig() async  -> Kdf?
+    
+    /**
+     * Clears the `kdf_config` value.
+     */
+    func clearKdfConfig() async 
+    
+    /**
+     * Stores the `v2_encrypted_migrations_grace_period_start` value.
+     */
+    func setV2EncryptedMigrationsGracePeriodStart(value: V2EncryptedMigrationsGracePeriodStart) async 
+    
+    /**
+     * Returns the `v2_encrypted_migrations_grace_period_start` value, if available.
+     */
+    func getV2EncryptedMigrationsGracePeriodStart() async  -> V2EncryptedMigrationsGracePeriodStart?
+    
+    /**
+     * Clears the `v2_encrypted_migrations_grace_period_start` value.
+     */
+    func clearV2EncryptedMigrationsGracePeriodStart() async 
+    
+}
+/**
+ * Foreign trait that Swift/Kotlin hosts implement to provide the state bridge.
+ *
+ * `StateBridgeImpl` is automatically implemented for the
+ * `UniffiStateBridge` adapter that wraps an
+ * `Arc<dyn StateBridgeForeignImpl>`.
+ */
+open class StateBridgeForeignImplImpl: StateBridgeForeignImpl, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_bitwarden_core_fn_clone_statebridgeforeignimpl(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_bitwarden_core_fn_free_statebridgeforeignimpl(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Stores the `user_key` value.
+     */
+open func setUserKey(value: SymmetricCryptoKey)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_set_user_key(
+                        self.uniffiCloneHandle(),FfiConverterTypeSymmetricCryptoKey_lower(value)
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Returns the `user_key` value, if available.
+     */
+open func getUserKey()async  -> SymmetricCryptoKey?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_get_user_key(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_bitwarden_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeSymmetricCryptoKey.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Clears the `user_key` value.
+     */
+open func clearUserKey()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_clear_user_key(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Stores the `user_key_id` value.
+     */
+open func setUserKeyId(value: KeyId)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_set_user_key_id(
+                        self.uniffiCloneHandle(),FfiConverterTypeKeyId_lower(value)
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Returns the `user_key_id` value, if available.
+     */
+open func getUserKeyId()async  -> KeyId?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_get_user_key_id(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_bitwarden_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeKeyId.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Clears the `user_key_id` value.
+     */
+open func clearUserKeyId()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_clear_user_key_id(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Stores the `persistent_pin_envelope` value.
+     */
+open func setPersistentPinEnvelope(value: PasswordProtectedKeyEnvelope)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_set_persistent_pin_envelope(
+                        self.uniffiCloneHandle(),FfiConverterTypePasswordProtectedKeyEnvelope_lower(value)
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Returns the `persistent_pin_envelope` value, if available.
+     */
+open func getPersistentPinEnvelope()async  -> PasswordProtectedKeyEnvelope?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_get_persistent_pin_envelope(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_bitwarden_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypePasswordProtectedKeyEnvelope.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Clears the `persistent_pin_envelope` value.
+     */
+open func clearPersistentPinEnvelope()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_clear_persistent_pin_envelope(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Stores the `ephemeral_pin_envelope` value.
+     */
+open func setEphemeralPinEnvelope(value: PasswordProtectedKeyEnvelope)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_set_ephemeral_pin_envelope(
+                        self.uniffiCloneHandle(),FfiConverterTypePasswordProtectedKeyEnvelope_lower(value)
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Returns the `ephemeral_pin_envelope` value, if available.
+     */
+open func getEphemeralPinEnvelope()async  -> PasswordProtectedKeyEnvelope?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_get_ephemeral_pin_envelope(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_bitwarden_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypePasswordProtectedKeyEnvelope.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Clears the `ephemeral_pin_envelope` value.
+     */
+open func clearEphemeralPinEnvelope()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_clear_ephemeral_pin_envelope(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Stores the `encrypted_pin` value.
+     */
+open func setEncryptedPin(value: EncString)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_set_encrypted_pin(
+                        self.uniffiCloneHandle(),FfiConverterTypeEncString_lower(value)
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Returns the `encrypted_pin` value, if available.
+     */
+open func getEncryptedPin()async  -> EncString?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_get_encrypted_pin(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_bitwarden_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeEncString.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Clears the `encrypted_pin` value.
+     */
+open func clearEncryptedPin()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_clear_encrypted_pin(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Stores the `v2_upgrade_token` value.
+     */
+open func setV2UpgradeToken(value: V2UpgradeToken)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_set_v2_upgrade_token(
+                        self.uniffiCloneHandle(),FfiConverterTypeV2UpgradeToken_lower(value)
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Returns the `v2_upgrade_token` value, if available.
+     */
+open func getV2UpgradeToken()async  -> V2UpgradeToken?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_get_v2_upgrade_token(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_bitwarden_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeV2UpgradeToken.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Clears the `v2_upgrade_token` value.
+     */
+open func clearV2UpgradeToken()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_clear_v2_upgrade_token(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Stores the `account_cryptographic_state` value.
+     */
+open func setAccountCryptographicState(value: WrappedAccountCryptographicState)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_set_account_cryptographic_state(
+                        self.uniffiCloneHandle(),FfiConverterTypeWrappedAccountCryptographicState_lower(value)
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Returns the `account_cryptographic_state` value, if available.
+     */
+open func getAccountCryptographicState()async  -> WrappedAccountCryptographicState?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_get_account_cryptographic_state(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_bitwarden_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeWrappedAccountCryptographicState.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Clears the `account_cryptographic_state` value.
+     */
+open func clearAccountCryptographicState()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_clear_account_cryptographic_state(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Stores the `masterpassword_unlock_data` value.
+     */
+open func setMasterpasswordUnlockData(value: MasterPasswordUnlockData)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_set_masterpassword_unlock_data(
+                        self.uniffiCloneHandle(),FfiConverterTypeMasterPasswordUnlockData_lower(value)
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Returns the `masterpassword_unlock_data` value, if available.
+     */
+open func getMasterpasswordUnlockData()async  -> MasterPasswordUnlockData?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_get_masterpassword_unlock_data(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_bitwarden_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeMasterPasswordUnlockData.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Clears the `masterpassword_unlock_data` value.
+     */
+open func clearMasterpasswordUnlockData()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_clear_masterpassword_unlock_data(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Stores the `webauthn_prf_unlock_data` value.
+     */
+open func setWebauthnPrfUnlockData(value: WebAuthnPrfUnlockData)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_set_webauthn_prf_unlock_data(
+                        self.uniffiCloneHandle(),FfiConverterTypeWebAuthnPrfUnlockData_lower(value)
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Returns the `webauthn_prf_unlock_data` value, if available.
+     */
+open func getWebauthnPrfUnlockData()async  -> WebAuthnPrfUnlockData?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_get_webauthn_prf_unlock_data(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_bitwarden_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeWebAuthnPrfUnlockData.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Clears the `webauthn_prf_unlock_data` value.
+     */
+open func clearWebauthnPrfUnlockData()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_clear_webauthn_prf_unlock_data(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Stores the `kdf_config` value.
+     */
+open func setKdfConfig(value: Kdf)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_set_kdf_config(
+                        self.uniffiCloneHandle(),FfiConverterTypeKdf_lower(value)
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Returns the `kdf_config` value, if available.
+     */
+open func getKdfConfig()async  -> Kdf?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_get_kdf_config(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_bitwarden_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeKdf.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Clears the `kdf_config` value.
+     */
+open func clearKdfConfig()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_clear_kdf_config(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Stores the `v2_encrypted_migrations_grace_period_start` value.
+     */
+open func setV2EncryptedMigrationsGracePeriodStart(value: V2EncryptedMigrationsGracePeriodStart)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_set_v2_encrypted_migrations_grace_period_start(
+                        self.uniffiCloneHandle(),FfiConverterTypeV2EncryptedMigrationsGracePeriodStart_lower(value)
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Returns the `v2_encrypted_migrations_grace_period_start` value, if available.
+     */
+open func getV2EncryptedMigrationsGracePeriodStart()async  -> V2EncryptedMigrationsGracePeriodStart?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_get_v2_encrypted_migrations_grace_period_start(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_bitwarden_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeV2EncryptedMigrationsGracePeriodStart.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Clears the `v2_encrypted_migrations_grace_period_start` value.
+     */
+open func clearV2EncryptedMigrationsGracePeriodStart()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_bitwarden_core_fn_method_statebridgeforeignimpl_clear_v2_encrypted_migrations_grace_period_start(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_bitwarden_core_rust_future_poll_void,
+            completeFunc: ffi_bitwarden_core_rust_future_complete_void,
+            freeFunc: ffi_bitwarden_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+
+    
+}
+
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceStateBridgeForeignImpl {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceStateBridgeForeignImpl = UniffiVTableCallbackInterfaceStateBridgeForeignImpl(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterTypeStateBridgeForeignImpl.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface StateBridgeForeignImpl: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterTypeStateBridgeForeignImpl.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface StateBridgeForeignImpl: handle missing in uniffiClone")
+            }
+        },
+        setUserKey: { (
+            uniffiHandle: UInt64,
+            value: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.setUserKey(
+                     value: try FfiConverterTypeSymmetricCryptoKey_lift(value)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        getUserKey: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> SymmetricCryptoKey? in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.getUserKey(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: SymmetricCryptoKey?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionTypeSymmetricCryptoKey.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        clearUserKey: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.clearUserKey(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        setUserKeyId: { (
+            uniffiHandle: UInt64,
+            value: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.setUserKeyId(
+                     value: try FfiConverterTypeKeyId_lift(value)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        getUserKeyId: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> KeyId? in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.getUserKeyId(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: KeyId?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionTypeKeyId.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        clearUserKeyId: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.clearUserKeyId(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        setPersistentPinEnvelope: { (
+            uniffiHandle: UInt64,
+            value: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.setPersistentPinEnvelope(
+                     value: try FfiConverterTypePasswordProtectedKeyEnvelope_lift(value)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        getPersistentPinEnvelope: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> PasswordProtectedKeyEnvelope? in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.getPersistentPinEnvelope(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: PasswordProtectedKeyEnvelope?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionTypePasswordProtectedKeyEnvelope.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        clearPersistentPinEnvelope: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.clearPersistentPinEnvelope(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        setEphemeralPinEnvelope: { (
+            uniffiHandle: UInt64,
+            value: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.setEphemeralPinEnvelope(
+                     value: try FfiConverterTypePasswordProtectedKeyEnvelope_lift(value)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        getEphemeralPinEnvelope: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> PasswordProtectedKeyEnvelope? in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.getEphemeralPinEnvelope(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: PasswordProtectedKeyEnvelope?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionTypePasswordProtectedKeyEnvelope.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        clearEphemeralPinEnvelope: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.clearEphemeralPinEnvelope(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        setEncryptedPin: { (
+            uniffiHandle: UInt64,
+            value: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.setEncryptedPin(
+                     value: try FfiConverterTypeEncString_lift(value)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        getEncryptedPin: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> EncString? in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.getEncryptedPin(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: EncString?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionTypeEncString.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        clearEncryptedPin: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.clearEncryptedPin(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        setV2UpgradeToken: { (
+            uniffiHandle: UInt64,
+            value: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.setV2UpgradeToken(
+                     value: try FfiConverterTypeV2UpgradeToken_lift(value)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        getV2UpgradeToken: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> V2UpgradeToken? in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.getV2UpgradeToken(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: V2UpgradeToken?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionTypeV2UpgradeToken.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        clearV2UpgradeToken: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.clearV2UpgradeToken(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        setAccountCryptographicState: { (
+            uniffiHandle: UInt64,
+            value: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.setAccountCryptographicState(
+                     value: try FfiConverterTypeWrappedAccountCryptographicState_lift(value)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        getAccountCryptographicState: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> WrappedAccountCryptographicState? in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.getAccountCryptographicState(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: WrappedAccountCryptographicState?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionTypeWrappedAccountCryptographicState.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        clearAccountCryptographicState: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.clearAccountCryptographicState(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        setMasterpasswordUnlockData: { (
+            uniffiHandle: UInt64,
+            value: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.setMasterpasswordUnlockData(
+                     value: try FfiConverterTypeMasterPasswordUnlockData_lift(value)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        getMasterpasswordUnlockData: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> MasterPasswordUnlockData? in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.getMasterpasswordUnlockData(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: MasterPasswordUnlockData?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionTypeMasterPasswordUnlockData.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        clearMasterpasswordUnlockData: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.clearMasterpasswordUnlockData(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        setWebauthnPrfUnlockData: { (
+            uniffiHandle: UInt64,
+            value: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.setWebauthnPrfUnlockData(
+                     value: try FfiConverterTypeWebAuthnPrfUnlockData_lift(value)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        getWebauthnPrfUnlockData: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> WebAuthnPrfUnlockData? in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.getWebauthnPrfUnlockData(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: WebAuthnPrfUnlockData?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionTypeWebAuthnPrfUnlockData.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        clearWebauthnPrfUnlockData: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.clearWebauthnPrfUnlockData(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        setKdfConfig: { (
+            uniffiHandle: UInt64,
+            value: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.setKdfConfig(
+                     value: try FfiConverterTypeKdf_lift(value)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        getKdfConfig: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> Kdf? in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.getKdfConfig(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: Kdf?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionTypeKdf.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        clearKdfConfig: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.clearKdfConfig(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        setV2EncryptedMigrationsGracePeriodStart: { (
+            uniffiHandle: UInt64,
+            value: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.setV2EncryptedMigrationsGracePeriodStart(
+                     value: try FfiConverterTypeV2EncryptedMigrationsGracePeriodStart_lift(value)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        getV2EncryptedMigrationsGracePeriodStart: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> V2EncryptedMigrationsGracePeriodStart? in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.getV2EncryptedMigrationsGracePeriodStart(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: V2EncryptedMigrationsGracePeriodStart?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionTypeV2EncryptedMigrationsGracePeriodStart.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        clearV2EncryptedMigrationsGracePeriodStart: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStateBridgeForeignImpl.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.clearV2EncryptedMigrationsGracePeriodStart(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceStateBridgeForeignImpl> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceStateBridgeForeignImpl>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitStateBridgeForeignImpl() {
+    uniffi_bitwarden_core_fn_init_callback_vtable_statebridgeforeignimpl(UniffiCallbackInterfaceStateBridgeForeignImpl.vtablePtr)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStateBridgeForeignImpl: FfiConverter {
+    fileprivate static let handleMap = UniffiHandleMap<StateBridgeForeignImpl>()
+
+    typealias FfiType = UInt64
+    typealias SwiftType = StateBridgeForeignImpl
+
+    public static func lift(_ handle: UInt64) throws -> StateBridgeForeignImpl {
+        if ((handle & 1) == 0) {
+            // Rust-generated handle, construct a new class that uses the handle to implement the
+            // interface
+            return StateBridgeForeignImplImpl(unsafeFromHandle: handle)
+        } else {
+            // Swift-generated handle, get the object from the handle map
+            return try handleMap.remove(handle: handle)
+        }
+    }
+
+    public static func lower(_ value: StateBridgeForeignImpl) -> UInt64 {
+         if let rustImpl = value as? StateBridgeForeignImplImpl {
+             // Rust-implemented object.  Clone the handle and return it
+            return rustImpl.uniffiCloneHandle()
+         } else {
+            // Swift object, generate a new vtable handle and return that.
+            return handleMap.insert(obj: value)
+         }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StateBridgeForeignImpl {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: StateBridgeForeignImpl, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStateBridgeForeignImpl_lift(_ handle: UInt64) throws -> StateBridgeForeignImpl {
+    return try FfiConverterTypeStateBridgeForeignImpl.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStateBridgeForeignImpl_lower(_ value: StateBridgeForeignImpl) -> UInt64 {
+    return FfiConverterTypeStateBridgeForeignImpl.lower(value)
+}
+
+
+
+
+/**
+ * Response for `new_auth_request`.
+ */
+public struct AuthRequestResponse: Equatable, Hashable, Codable {
     /**
      * Base64 encoded private key
      * This key is temporarily passed back and will most likely not be available in the future
      */
-    public let privateKey: String
+    public let privateKey: B64
     /**
      * Base64 encoded public key
      */
-    public let publicKey: String
+    public let publicKey: B64
     /**
      * Fingerprint of the public key
      */
@@ -517,10 +3309,10 @@ public struct AuthRequestResponse {
         /**
          * Base64 encoded private key
          * This key is temporarily passed back and will most likely not be available in the future
-         */privateKey: String, 
+         */privateKey: B64, 
         /**
          * Base64 encoded public key
-         */publicKey: String, 
+         */publicKey: B64, 
         /**
          * Fingerprint of the public key
          */fingerprint: String, 
@@ -532,60 +3324,49 @@ public struct AuthRequestResponse {
         self.fingerprint = fingerprint
         self.accessCode = accessCode
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension AuthRequestResponse: Sendable {}
+#endif
 
-
-extension AuthRequestResponse: Equatable, Hashable {
-    public static func ==(lhs: AuthRequestResponse, rhs: AuthRequestResponse) -> Bool {
-        if lhs.privateKey != rhs.privateKey {
-            return false
-        }
-        if lhs.publicKey != rhs.publicKey {
-            return false
-        }
-        if lhs.fingerprint != rhs.fingerprint {
-            return false
-        }
-        if lhs.accessCode != rhs.accessCode {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(privateKey)
-        hasher.combine(publicKey)
-        hasher.combine(fingerprint)
-        hasher.combine(accessCode)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeAuthRequestResponse: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AuthRequestResponse {
         return
             try AuthRequestResponse(
-                privateKey: FfiConverterString.read(from: &buf), 
-                publicKey: FfiConverterString.read(from: &buf), 
+                privateKey: FfiConverterTypeB64.read(from: &buf), 
+                publicKey: FfiConverterTypeB64.read(from: &buf), 
                 fingerprint: FfiConverterString.read(from: &buf), 
                 accessCode: FfiConverterString.read(from: &buf)
         )
     }
 
     public static func write(_ value: AuthRequestResponse, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.privateKey, into: &buf)
-        FfiConverterString.write(value.publicKey, into: &buf)
+        FfiConverterTypeB64.write(value.privateKey, into: &buf)
+        FfiConverterTypeB64.write(value.publicKey, into: &buf)
         FfiConverterString.write(value.fingerprint, into: &buf)
         FfiConverterString.write(value.accessCode, into: &buf)
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeAuthRequestResponse_lift(_ buf: RustBuffer) throws -> AuthRequestResponse {
     return try FfiConverterTypeAuthRequestResponse.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeAuthRequestResponse_lower(_ value: AuthRequestResponse) -> RustBuffer {
     return FfiConverterTypeAuthRequestResponse.lower(value)
 }
@@ -604,11 +3385,14 @@ public func FfiConverterTypeAuthRequestResponse_lower(_ value: AuthRequestRespon
  * api_url: "https://api.bitwarden.com".to_string(),
  * user_agent: "Bitwarden Rust-SDK".to_string(),
  * device_type: DeviceType::SDK,
+ * bitwarden_client_version: None,
+ * bitwarden_package_type: None,
+ * device_identifier: None,
  * };
  * let default = ClientSettings::default();
  * ```
  */
-public struct ClientSettings {
+public struct ClientSettings: Equatable, Hashable, Codable {
     /**
      * The identity url of the targeted Bitwarden instance. Defaults to `https://identity.bitwarden.com`
      */
@@ -625,6 +3409,19 @@ public struct ClientSettings {
      * Device type to send to Bitwarden. Defaults to SDK
      */
     public let deviceType: DeviceType
+    /**
+     * Device identifier to send to Bitwarden. Optional for now in transition period.
+     */
+    public let deviceIdentifier: String?
+    /**
+     * Bitwarden Client Version to send to Bitwarden. Optional for now in transition period.
+     */
+    public let bitwardenClientVersion: String?
+    /**
+     * Bitwarden Package Type to send to Bitwarden. We should evaluate this field to see if it
+     * should be optional later.
+     */
+    public let bitwardenPackageType: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -640,42 +3437,38 @@ public struct ClientSettings {
          */userAgent: String, 
         /**
          * Device type to send to Bitwarden. Defaults to SDK
-         */deviceType: DeviceType) {
+         */deviceType: DeviceType, 
+        /**
+         * Device identifier to send to Bitwarden. Optional for now in transition period.
+         */deviceIdentifier: String?, 
+        /**
+         * Bitwarden Client Version to send to Bitwarden. Optional for now in transition period.
+         */bitwardenClientVersion: String?, 
+        /**
+         * Bitwarden Package Type to send to Bitwarden. We should evaluate this field to see if it
+         * should be optional later.
+         */bitwardenPackageType: String?) {
         self.identityUrl = identityUrl
         self.apiUrl = apiUrl
         self.userAgent = userAgent
         self.deviceType = deviceType
+        self.deviceIdentifier = deviceIdentifier
+        self.bitwardenClientVersion = bitwardenClientVersion
+        self.bitwardenPackageType = bitwardenPackageType
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension ClientSettings: Sendable {}
+#endif
 
-
-extension ClientSettings: Equatable, Hashable {
-    public static func ==(lhs: ClientSettings, rhs: ClientSettings) -> Bool {
-        if lhs.identityUrl != rhs.identityUrl {
-            return false
-        }
-        if lhs.apiUrl != rhs.apiUrl {
-            return false
-        }
-        if lhs.userAgent != rhs.userAgent {
-            return false
-        }
-        if lhs.deviceType != rhs.deviceType {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(identityUrl)
-        hasher.combine(apiUrl)
-        hasher.combine(userAgent)
-        hasher.combine(deviceType)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeClientSettings: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ClientSettings {
         return
@@ -683,7 +3476,10 @@ public struct FfiConverterTypeClientSettings: FfiConverterRustBuffer {
                 identityUrl: FfiConverterString.read(from: &buf), 
                 apiUrl: FfiConverterString.read(from: &buf), 
                 userAgent: FfiConverterString.read(from: &buf), 
-                deviceType: FfiConverterTypeDeviceType.read(from: &buf)
+                deviceType: FfiConverterTypeDeviceType.read(from: &buf), 
+                deviceIdentifier: FfiConverterOptionString.read(from: &buf), 
+                bitwardenClientVersion: FfiConverterOptionString.read(from: &buf), 
+                bitwardenPackageType: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -692,26 +3488,47 @@ public struct FfiConverterTypeClientSettings: FfiConverterRustBuffer {
         FfiConverterString.write(value.apiUrl, into: &buf)
         FfiConverterString.write(value.userAgent, into: &buf)
         FfiConverterTypeDeviceType.write(value.deviceType, into: &buf)
+        FfiConverterOptionString.write(value.deviceIdentifier, into: &buf)
+        FfiConverterOptionString.write(value.bitwardenClientVersion, into: &buf)
+        FfiConverterOptionString.write(value.bitwardenPackageType, into: &buf)
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeClientSettings_lift(_ buf: RustBuffer) throws -> ClientSettings {
     return try FfiConverterTypeClientSettings.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeClientSettings_lower(_ value: ClientSettings) -> RustBuffer {
     return FfiConverterTypeClientSettings.lower(value)
 }
 
 
-public struct DeriveKeyConnectorRequest {
+/**
+ * Request for migrating an account from password to key connector.
+ */
+public struct DeriveKeyConnectorRequest: Equatable, Hashable, Codable {
     /**
      * Encrypted user key, used to validate the master key
      */
     public let userKeyEncrypted: EncString
+    /**
+     * The user's master password
+     */
     public let password: String
+    /**
+     * The KDF parameters used to derive the master key
+     */
     public let kdf: Kdf
+    /**
+     * The user's email address
+     */
     public let email: String
 
     // Default memberwise initializers are never public by default, so we
@@ -719,42 +3536,34 @@ public struct DeriveKeyConnectorRequest {
     public init(
         /**
          * Encrypted user key, used to validate the master key
-         */userKeyEncrypted: EncString, password: String, kdf: Kdf, email: String) {
+         */userKeyEncrypted: EncString, 
+        /**
+         * The user's master password
+         */password: String, 
+        /**
+         * The KDF parameters used to derive the master key
+         */kdf: Kdf, 
+        /**
+         * The user's email address
+         */email: String) {
         self.userKeyEncrypted = userKeyEncrypted
         self.password = password
         self.kdf = kdf
         self.email = email
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension DeriveKeyConnectorRequest: Sendable {}
+#endif
 
-
-extension DeriveKeyConnectorRequest: Equatable, Hashable {
-    public static func ==(lhs: DeriveKeyConnectorRequest, rhs: DeriveKeyConnectorRequest) -> Bool {
-        if lhs.userKeyEncrypted != rhs.userKeyEncrypted {
-            return false
-        }
-        if lhs.password != rhs.password {
-            return false
-        }
-        if lhs.kdf != rhs.kdf {
-            return false
-        }
-        if lhs.email != rhs.email {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(userKeyEncrypted)
-        hasher.combine(password)
-        hasher.combine(kdf)
-        hasher.combine(email)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeDeriveKeyConnectorRequest: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeriveKeyConnectorRequest {
         return
@@ -775,22 +3584,31 @@ public struct FfiConverterTypeDeriveKeyConnectorRequest: FfiConverterRustBuffer 
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeDeriveKeyConnectorRequest_lift(_ buf: RustBuffer) throws -> DeriveKeyConnectorRequest {
     return try FfiConverterTypeDeriveKeyConnectorRequest.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeDeriveKeyConnectorRequest_lower(_ value: DeriveKeyConnectorRequest) -> RustBuffer {
     return FfiConverterTypeDeriveKeyConnectorRequest.lower(value)
 }
 
 
-public struct DerivePinKeyResponse {
+/**
+ * Request for deriving a pin protected user key
+ */
+public struct DerivePinKeyResponse: Equatable, Hashable, Codable {
     /**
-     * [UserKey](bitwarden_crypto::UserKey) protected by PIN
+     * [UserKey][bitwarden_crypto::UserKey] protected by PIN
      */
     public let pinProtectedUserKey: EncString
     /**
-     * PIN protected by [UserKey](bitwarden_crypto::UserKey)
+     * PIN protected by [UserKey][bitwarden_crypto::UserKey]
      */
     public let encryptedPin: EncString
 
@@ -798,36 +3616,27 @@ public struct DerivePinKeyResponse {
     // declare one manually.
     public init(
         /**
-         * [UserKey](bitwarden_crypto::UserKey) protected by PIN
+         * [UserKey][bitwarden_crypto::UserKey] protected by PIN
          */pinProtectedUserKey: EncString, 
         /**
-         * PIN protected by [UserKey](bitwarden_crypto::UserKey)
+         * PIN protected by [UserKey][bitwarden_crypto::UserKey]
          */encryptedPin: EncString) {
         self.pinProtectedUserKey = pinProtectedUserKey
         self.encryptedPin = encryptedPin
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension DerivePinKeyResponse: Sendable {}
+#endif
 
-
-extension DerivePinKeyResponse: Equatable, Hashable {
-    public static func ==(lhs: DerivePinKeyResponse, rhs: DerivePinKeyResponse) -> Bool {
-        if lhs.pinProtectedUserKey != rhs.pinProtectedUserKey {
-            return false
-        }
-        if lhs.encryptedPin != rhs.encryptedPin {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(pinProtectedUserKey)
-        hasher.combine(encryptedPin)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeDerivePinKeyResponse: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DerivePinKeyResponse {
         return
@@ -844,16 +3653,94 @@ public struct FfiConverterTypeDerivePinKeyResponse: FfiConverterRustBuffer {
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeDerivePinKeyResponse_lift(_ buf: RustBuffer) throws -> DerivePinKeyResponse {
     return try FfiConverterTypeDerivePinKeyResponse.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeDerivePinKeyResponse_lower(_ value: DerivePinKeyResponse) -> RustBuffer {
     return FfiConverterTypeDerivePinKeyResponse.lower(value)
 }
 
 
-public struct FingerprintRequest {
+/**
+ * Request for deriving a pin protected user key
+ */
+public struct EnrollPinResponse: Equatable, Hashable, Codable {
+    /**
+     * [UserKey][bitwarden_crypto::UserKey] protected by PIN
+     */
+    public let pinProtectedUserKeyEnvelope: PasswordProtectedKeyEnvelope
+    /**
+     * PIN protected by [UserKey][bitwarden_crypto::UserKey]
+     */
+    public let userKeyEncryptedPin: EncString
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * [UserKey][bitwarden_crypto::UserKey] protected by PIN
+         */pinProtectedUserKeyEnvelope: PasswordProtectedKeyEnvelope, 
+        /**
+         * PIN protected by [UserKey][bitwarden_crypto::UserKey]
+         */userKeyEncryptedPin: EncString) {
+        self.pinProtectedUserKeyEnvelope = pinProtectedUserKeyEnvelope
+        self.userKeyEncryptedPin = userKeyEncryptedPin
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EnrollPinResponse: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEnrollPinResponse: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EnrollPinResponse {
+        return
+            try EnrollPinResponse(
+                pinProtectedUserKeyEnvelope: FfiConverterTypePasswordProtectedKeyEnvelope.read(from: &buf), 
+                userKeyEncryptedPin: FfiConverterTypeEncString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EnrollPinResponse, into buf: inout [UInt8]) {
+        FfiConverterTypePasswordProtectedKeyEnvelope.write(value.pinProtectedUserKeyEnvelope, into: &buf)
+        FfiConverterTypeEncString.write(value.userKeyEncryptedPin, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEnrollPinResponse_lift(_ buf: RustBuffer) throws -> EnrollPinResponse {
+    return try FfiConverterTypeEnrollPinResponse.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEnrollPinResponse_lower(_ value: EnrollPinResponse) -> RustBuffer {
+    return FfiConverterTypeEnrollPinResponse.lower(value)
+}
+
+
+/**
+ * Request to generate a fingerprint.
+ */
+public struct FingerprintRequest: Equatable, Hashable, Codable {
     /**
      * The input material, used in the fingerprint generation process.
      */
@@ -861,7 +3748,7 @@ public struct FingerprintRequest {
     /**
      * The user's public key encoded with base64.
      */
-    public let publicKey: String
+    public let publicKey: B64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -871,113 +3758,121 @@ public struct FingerprintRequest {
          */fingerprintMaterial: String, 
         /**
          * The user's public key encoded with base64.
-         */publicKey: String) {
+         */publicKey: B64) {
         self.fingerprintMaterial = fingerprintMaterial
         self.publicKey = publicKey
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension FingerprintRequest: Sendable {}
+#endif
 
-
-extension FingerprintRequest: Equatable, Hashable {
-    public static func ==(lhs: FingerprintRequest, rhs: FingerprintRequest) -> Bool {
-        if lhs.fingerprintMaterial != rhs.fingerprintMaterial {
-            return false
-        }
-        if lhs.publicKey != rhs.publicKey {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(fingerprintMaterial)
-        hasher.combine(publicKey)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeFingerprintRequest: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FingerprintRequest {
         return
             try FingerprintRequest(
                 fingerprintMaterial: FfiConverterString.read(from: &buf), 
-                publicKey: FfiConverterString.read(from: &buf)
+                publicKey: FfiConverterTypeB64.read(from: &buf)
         )
     }
 
     public static func write(_ value: FingerprintRequest, into buf: inout [UInt8]) {
         FfiConverterString.write(value.fingerprintMaterial, into: &buf)
-        FfiConverterString.write(value.publicKey, into: &buf)
+        FfiConverterTypeB64.write(value.publicKey, into: &buf)
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeFingerprintRequest_lift(_ buf: RustBuffer) throws -> FingerprintRequest {
     return try FfiConverterTypeFingerprintRequest.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeFingerprintRequest_lower(_ value: FingerprintRequest) -> RustBuffer {
     return FfiConverterTypeFingerprintRequest.lower(value)
 }
 
 
-public struct InitOrgCryptoRequest {
+/**
+ * Represents the request to initialize the user's organizational cryptographic state.
+ */
+public struct InitOrgCryptoRequest: Equatable, Hashable, Codable {
     /**
      * The encryption keys for all the organizations the user is a part of
      */
-    public let organizationKeys: [Uuid: AsymmetricEncString]
+    public let organizationKeys: [OrganizationId: UnsignedSharedKey]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
          * The encryption keys for all the organizations the user is a part of
-         */organizationKeys: [Uuid: AsymmetricEncString]) {
+         */organizationKeys: [OrganizationId: UnsignedSharedKey]) {
         self.organizationKeys = organizationKeys
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension InitOrgCryptoRequest: Sendable {}
+#endif
 
-
-extension InitOrgCryptoRequest: Equatable, Hashable {
-    public static func ==(lhs: InitOrgCryptoRequest, rhs: InitOrgCryptoRequest) -> Bool {
-        if lhs.organizationKeys != rhs.organizationKeys {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(organizationKeys)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeInitOrgCryptoRequest: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> InitOrgCryptoRequest {
         return
             try InitOrgCryptoRequest(
-                organizationKeys: FfiConverterDictionaryTypeUuidTypeAsymmetricEncString.read(from: &buf)
+                organizationKeys: FfiConverterDictionaryTypeOrganizationIdTypeUnsignedSharedKey.read(from: &buf)
         )
     }
 
     public static func write(_ value: InitOrgCryptoRequest, into buf: inout [UInt8]) {
-        FfiConverterDictionaryTypeUuidTypeAsymmetricEncString.write(value.organizationKeys, into: &buf)
+        FfiConverterDictionaryTypeOrganizationIdTypeUnsignedSharedKey.write(value.organizationKeys, into: &buf)
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeInitOrgCryptoRequest_lift(_ buf: RustBuffer) throws -> InitOrgCryptoRequest {
     return try FfiConverterTypeInitOrgCryptoRequest.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeInitOrgCryptoRequest_lower(_ value: InitOrgCryptoRequest) -> RustBuffer {
     return FfiConverterTypeInitOrgCryptoRequest.lower(value)
 }
 
 
-public struct InitUserCryptoRequest {
+/**
+ * State used for initializing the user cryptographic state.
+ */
+public struct InitUserCryptoRequest: Equatable, Hashable, Codable {
+    /**
+     * The user's ID.
+     */
+    public let userId: UserId?
     /**
      * The user's KDF parameters, as received from the prelogin request
      */
@@ -987,17 +3882,25 @@ public struct InitUserCryptoRequest {
      */
     public let email: String
     /**
-     * The user's encrypted private key
+     * The user's account cryptographic state, containing their signature and
+     * public-key-encryption keys, along with the signed security state, protected by the user key
      */
-    public let privateKey: String
+    public let accountCryptographicState: WrappedAccountCryptographicState
     /**
-     * The initialization method to use
+     * The method to decrypt the user's account symmetric key (user key)
      */
     public let method: InitUserCryptoMethod
+    /**
+     * Optional V2 upgrade token for automatic key rotation from V1 to V2
+     */
+    public let upgradeToken: V2UpgradeToken?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
+        /**
+         * The user's ID.
+         */userId: UserId?, 
         /**
          * The user's KDF parameters, as received from the prelogin request
          */kdfParams: Kdf, 
@@ -1005,141 +3908,248 @@ public struct InitUserCryptoRequest {
          * The user's email address
          */email: String, 
         /**
-         * The user's encrypted private key
-         */privateKey: String, 
+         * The user's account cryptographic state, containing their signature and
+         * public-key-encryption keys, along with the signed security state, protected by the user key
+         */accountCryptographicState: WrappedAccountCryptographicState, 
         /**
-         * The initialization method to use
-         */method: InitUserCryptoMethod) {
+         * The method to decrypt the user's account symmetric key (user key)
+         */method: InitUserCryptoMethod, 
+        /**
+         * Optional V2 upgrade token for automatic key rotation from V1 to V2
+         */upgradeToken: V2UpgradeToken?) {
+        self.userId = userId
         self.kdfParams = kdfParams
         self.email = email
-        self.privateKey = privateKey
+        self.accountCryptographicState = accountCryptographicState
         self.method = method
+        self.upgradeToken = upgradeToken
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension InitUserCryptoRequest: Sendable {}
+#endif
 
-
-extension InitUserCryptoRequest: Equatable, Hashable {
-    public static func ==(lhs: InitUserCryptoRequest, rhs: InitUserCryptoRequest) -> Bool {
-        if lhs.kdfParams != rhs.kdfParams {
-            return false
-        }
-        if lhs.email != rhs.email {
-            return false
-        }
-        if lhs.privateKey != rhs.privateKey {
-            return false
-        }
-        if lhs.method != rhs.method {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(kdfParams)
-        hasher.combine(email)
-        hasher.combine(privateKey)
-        hasher.combine(method)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeInitUserCryptoRequest: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> InitUserCryptoRequest {
         return
             try InitUserCryptoRequest(
+                userId: FfiConverterOptionTypeUserId.read(from: &buf), 
                 kdfParams: FfiConverterTypeKdf.read(from: &buf), 
                 email: FfiConverterString.read(from: &buf), 
-                privateKey: FfiConverterString.read(from: &buf), 
-                method: FfiConverterTypeInitUserCryptoMethod.read(from: &buf)
+                accountCryptographicState: FfiConverterTypeWrappedAccountCryptographicState.read(from: &buf), 
+                method: FfiConverterTypeInitUserCryptoMethod.read(from: &buf), 
+                upgradeToken: FfiConverterOptionTypeV2UpgradeToken.read(from: &buf)
         )
     }
 
     public static func write(_ value: InitUserCryptoRequest, into buf: inout [UInt8]) {
+        FfiConverterOptionTypeUserId.write(value.userId, into: &buf)
         FfiConverterTypeKdf.write(value.kdfParams, into: &buf)
         FfiConverterString.write(value.email, into: &buf)
-        FfiConverterString.write(value.privateKey, into: &buf)
+        FfiConverterTypeWrappedAccountCryptographicState.write(value.accountCryptographicState, into: &buf)
         FfiConverterTypeInitUserCryptoMethod.write(value.method, into: &buf)
+        FfiConverterOptionTypeV2UpgradeToken.write(value.upgradeToken, into: &buf)
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeInitUserCryptoRequest_lift(_ buf: RustBuffer) throws -> InitUserCryptoRequest {
     return try FfiConverterTypeInitUserCryptoRequest.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeInitUserCryptoRequest_lower(_ value: InitUserCryptoRequest) -> RustBuffer {
     return FfiConverterTypeInitUserCryptoRequest.lower(value)
 }
 
 
-public struct KeyConnectorResponse {
-    public let masterKey: String
+public struct KeyConnectorResponse: Equatable, Hashable, Codable {
+    public let masterKey: B64
     public let encryptedUserKey: String
     public let keys: RsaKeyPair
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(masterKey: String, encryptedUserKey: String, keys: RsaKeyPair) {
+    public init(masterKey: B64, encryptedUserKey: String, keys: RsaKeyPair) {
         self.masterKey = masterKey
         self.encryptedUserKey = encryptedUserKey
         self.keys = keys
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension KeyConnectorResponse: Sendable {}
+#endif
 
-
-extension KeyConnectorResponse: Equatable, Hashable {
-    public static func ==(lhs: KeyConnectorResponse, rhs: KeyConnectorResponse) -> Bool {
-        if lhs.masterKey != rhs.masterKey {
-            return false
-        }
-        if lhs.encryptedUserKey != rhs.encryptedUserKey {
-            return false
-        }
-        if lhs.keys != rhs.keys {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(masterKey)
-        hasher.combine(encryptedUserKey)
-        hasher.combine(keys)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeKeyConnectorResponse: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KeyConnectorResponse {
         return
             try KeyConnectorResponse(
-                masterKey: FfiConverterString.read(from: &buf), 
+                masterKey: FfiConverterTypeB64.read(from: &buf), 
                 encryptedUserKey: FfiConverterString.read(from: &buf), 
                 keys: FfiConverterTypeRsaKeyPair.read(from: &buf)
         )
     }
 
     public static func write(_ value: KeyConnectorResponse, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.masterKey, into: &buf)
+        FfiConverterTypeB64.write(value.masterKey, into: &buf)
         FfiConverterString.write(value.encryptedUserKey, into: &buf)
         FfiConverterTypeRsaKeyPair.write(value.keys, into: &buf)
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeKeyConnectorResponse_lift(_ buf: RustBuffer) throws -> KeyConnectorResponse {
     return try FfiConverterTypeKeyConnectorResponse.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeKeyConnectorResponse_lower(_ value: KeyConnectorResponse) -> RustBuffer {
     return FfiConverterTypeKeyConnectorResponse.lower(value)
 }
 
 
-public struct MasterPasswordPolicyOptions {
+/**
+ * Represents the local user data key, wrapped by user key.
+ * This key is used to encrypt local user data (e.g., password generator history).
+ */
+public struct LocalUserDataKeyState: Equatable, Hashable, Codable {
+    public let wrappedKey: EncString
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(wrappedKey: EncString) {
+        self.wrappedKey = wrappedKey
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension LocalUserDataKeyState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLocalUserDataKeyState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LocalUserDataKeyState {
+        return
+            try LocalUserDataKeyState(
+                wrappedKey: FfiConverterTypeEncString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LocalUserDataKeyState, into buf: inout [UInt8]) {
+        FfiConverterTypeEncString.write(value.wrappedKey, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLocalUserDataKeyState_lift(_ buf: RustBuffer) throws -> LocalUserDataKeyState {
+    return try FfiConverterTypeLocalUserDataKeyState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLocalUserDataKeyState_lower(_ value: LocalUserDataKeyState) -> RustBuffer {
+    return FfiConverterTypeLocalUserDataKeyState.lower(value)
+}
+
+
+/**
+ * Represents the data required to authenticate with the master password.
+ */
+public struct MasterPasswordAuthenticationData: Equatable, Hashable, Codable {
+    public let kdf: Kdf
+    public let salt: String
+    public let masterPasswordAuthenticationHash: B64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kdf: Kdf, salt: String, masterPasswordAuthenticationHash: B64) {
+        self.kdf = kdf
+        self.salt = salt
+        self.masterPasswordAuthenticationHash = masterPasswordAuthenticationHash
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MasterPasswordAuthenticationData: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMasterPasswordAuthenticationData: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MasterPasswordAuthenticationData {
+        return
+            try MasterPasswordAuthenticationData(
+                kdf: FfiConverterTypeKdf.read(from: &buf), 
+                salt: FfiConverterString.read(from: &buf), 
+                masterPasswordAuthenticationHash: FfiConverterTypeB64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MasterPasswordAuthenticationData, into buf: inout [UInt8]) {
+        FfiConverterTypeKdf.write(value.kdf, into: &buf)
+        FfiConverterString.write(value.salt, into: &buf)
+        FfiConverterTypeB64.write(value.masterPasswordAuthenticationHash, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMasterPasswordAuthenticationData_lift(_ buf: RustBuffer) throws -> MasterPasswordAuthenticationData {
+    return try FfiConverterTypeMasterPasswordAuthenticationData.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMasterPasswordAuthenticationData_lower(_ value: MasterPasswordAuthenticationData) -> RustBuffer {
+    return FfiConverterTypeMasterPasswordAuthenticationData.lower(value)
+}
+
+
+public struct MasterPasswordPolicyOptions: Equatable, Hashable, Codable {
     public let minComplexity: UInt8
     public let minLength: UInt8
     public let requireUpper: Bool
@@ -1169,48 +4179,19 @@ public struct MasterPasswordPolicyOptions {
         self.requireSpecial = requireSpecial
         self.enforceOnLogin = enforceOnLogin
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension MasterPasswordPolicyOptions: Sendable {}
+#endif
 
-
-extension MasterPasswordPolicyOptions: Equatable, Hashable {
-    public static func ==(lhs: MasterPasswordPolicyOptions, rhs: MasterPasswordPolicyOptions) -> Bool {
-        if lhs.minComplexity != rhs.minComplexity {
-            return false
-        }
-        if lhs.minLength != rhs.minLength {
-            return false
-        }
-        if lhs.requireUpper != rhs.requireUpper {
-            return false
-        }
-        if lhs.requireLower != rhs.requireLower {
-            return false
-        }
-        if lhs.requireNumbers != rhs.requireNumbers {
-            return false
-        }
-        if lhs.requireSpecial != rhs.requireSpecial {
-            return false
-        }
-        if lhs.enforceOnLogin != rhs.enforceOnLogin {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(minComplexity)
-        hasher.combine(minLength)
-        hasher.combine(requireUpper)
-        hasher.combine(requireLower)
-        hasher.combine(requireNumbers)
-        hasher.combine(requireSpecial)
-        hasher.combine(enforceOnLogin)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeMasterPasswordPolicyOptions: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MasterPasswordPolicyOptions {
         return
@@ -1237,215 +4218,669 @@ public struct FfiConverterTypeMasterPasswordPolicyOptions: FfiConverterRustBuffe
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeMasterPasswordPolicyOptions_lift(_ buf: RustBuffer) throws -> MasterPasswordPolicyOptions {
     return try FfiConverterTypeMasterPasswordPolicyOptions.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeMasterPasswordPolicyOptions_lower(_ value: MasterPasswordPolicyOptions) -> RustBuffer {
     return FfiConverterTypeMasterPasswordPolicyOptions.lower(value)
 }
 
 
-public struct RegisterKeyResponse {
-    public let masterPasswordHash: String
-    public let encryptedUserKey: String
+/**
+ * Represents the data required to unlock with the master password.
+ */
+public struct MasterPasswordUnlockData: Equatable, Hashable, Codable {
+    /**
+     * The key derivation function used to derive the master key
+     */
+    public let kdf: Kdf
+    /**
+     * The master key wrapped user key
+     */
+    public let masterKeyWrappedUserKey: EncString
+    /**
+     * The salt used in the KDF, typically the user's email
+     */
+    public let salt: String
+    /**
+     * When present, this asserts what key is contained in the
+     * `master_key_wrapped_user_key`.
+     */
+    public let containedKeyId: KeyId?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The key derivation function used to derive the master key
+         */kdf: Kdf, 
+        /**
+         * The master key wrapped user key
+         */masterKeyWrappedUserKey: EncString, 
+        /**
+         * The salt used in the KDF, typically the user's email
+         */salt: String, 
+        /**
+         * When present, this asserts what key is contained in the
+         * `master_key_wrapped_user_key`.
+         */containedKeyId: KeyId? = nil) {
+        self.kdf = kdf
+        self.masterKeyWrappedUserKey = masterKeyWrappedUserKey
+        self.salt = salt
+        self.containedKeyId = containedKeyId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MasterPasswordUnlockData: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMasterPasswordUnlockData: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MasterPasswordUnlockData {
+        return
+            try MasterPasswordUnlockData(
+                kdf: FfiConverterTypeKdf.read(from: &buf), 
+                masterKeyWrappedUserKey: FfiConverterTypeEncString.read(from: &buf), 
+                salt: FfiConverterString.read(from: &buf), 
+                containedKeyId: FfiConverterOptionTypeKeyId.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MasterPasswordUnlockData, into buf: inout [UInt8]) {
+        FfiConverterTypeKdf.write(value.kdf, into: &buf)
+        FfiConverterTypeEncString.write(value.masterKeyWrappedUserKey, into: &buf)
+        FfiConverterString.write(value.salt, into: &buf)
+        FfiConverterOptionTypeKeyId.write(value.containedKeyId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMasterPasswordUnlockData_lift(_ buf: RustBuffer) throws -> MasterPasswordUnlockData {
+    return try FfiConverterTypeMasterPasswordUnlockData.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMasterPasswordUnlockData_lower(_ value: MasterPasswordUnlockData) -> RustBuffer {
+    return FfiConverterTypeMasterPasswordUnlockData.lower(value)
+}
+
+
+/**
+ * A persisted organization encryption key.
+ *
+ * Stored in a Repository keyed by [`OrganizationId`].
+ * The `org_id` is included in the struct so it can be recovered from `Repository::list()`.
+ */
+public struct OrganizationSharedKey: Equatable, Hashable, Codable {
+    /**
+     * The organization this key belongs to.
+     */
+    public let orgId: OrganizationId
+    /**
+     * The organization's shared encryption key.
+     */
+    public let key: UnsignedSharedKey
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The organization this key belongs to.
+         */orgId: OrganizationId, 
+        /**
+         * The organization's shared encryption key.
+         */key: UnsignedSharedKey) {
+        self.orgId = orgId
+        self.key = key
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension OrganizationSharedKey: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOrganizationSharedKey: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OrganizationSharedKey {
+        return
+            try OrganizationSharedKey(
+                orgId: FfiConverterTypeOrganizationId.read(from: &buf), 
+                key: FfiConverterTypeUnsignedSharedKey.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OrganizationSharedKey, into buf: inout [UInt8]) {
+        FfiConverterTypeOrganizationId.write(value.orgId, into: &buf)
+        FfiConverterTypeUnsignedSharedKey.write(value.key, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOrganizationSharedKey_lift(_ buf: RustBuffer) throws -> OrganizationSharedKey {
+    return try FfiConverterTypeOrganizationSharedKey.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOrganizationSharedKey_lower(_ value: OrganizationSharedKey) -> RustBuffer {
+    return FfiConverterTypeOrganizationSharedKey.lower(value)
+}
+
+
+public struct RegisterKeyResponse: Equatable, Hashable, Codable {
+    public let masterPasswordHash: B64
+    public let encryptedUserKey: EncString
     public let keys: RsaKeyPair
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(masterPasswordHash: String, encryptedUserKey: String, keys: RsaKeyPair) {
+    public init(masterPasswordHash: B64, encryptedUserKey: EncString, keys: RsaKeyPair) {
         self.masterPasswordHash = masterPasswordHash
         self.encryptedUserKey = encryptedUserKey
         self.keys = keys
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension RegisterKeyResponse: Sendable {}
+#endif
 
-
-extension RegisterKeyResponse: Equatable, Hashable {
-    public static func ==(lhs: RegisterKeyResponse, rhs: RegisterKeyResponse) -> Bool {
-        if lhs.masterPasswordHash != rhs.masterPasswordHash {
-            return false
-        }
-        if lhs.encryptedUserKey != rhs.encryptedUserKey {
-            return false
-        }
-        if lhs.keys != rhs.keys {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(masterPasswordHash)
-        hasher.combine(encryptedUserKey)
-        hasher.combine(keys)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeRegisterKeyResponse: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RegisterKeyResponse {
         return
             try RegisterKeyResponse(
-                masterPasswordHash: FfiConverterString.read(from: &buf), 
-                encryptedUserKey: FfiConverterString.read(from: &buf), 
+                masterPasswordHash: FfiConverterTypeB64.read(from: &buf), 
+                encryptedUserKey: FfiConverterTypeEncString.read(from: &buf), 
                 keys: FfiConverterTypeRsaKeyPair.read(from: &buf)
         )
     }
 
     public static func write(_ value: RegisterKeyResponse, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.masterPasswordHash, into: &buf)
-        FfiConverterString.write(value.encryptedUserKey, into: &buf)
+        FfiConverterTypeB64.write(value.masterPasswordHash, into: &buf)
+        FfiConverterTypeEncString.write(value.encryptedUserKey, into: &buf)
         FfiConverterTypeRsaKeyPair.write(value.keys, into: &buf)
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeRegisterKeyResponse_lift(_ buf: RustBuffer) throws -> RegisterKeyResponse {
     return try FfiConverterTypeRegisterKeyResponse.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeRegisterKeyResponse_lower(_ value: RegisterKeyResponse) -> RustBuffer {
     return FfiConverterTypeRegisterKeyResponse.lower(value)
 }
 
 
-public struct RegisterTdeKeyResponse {
+public struct RegisterTdeKeyResponse: Equatable, Hashable, Codable {
     public let privateKey: EncString
-    public let publicKey: String
-    public let adminReset: AsymmetricEncString
+    public let publicKey: B64
+    public let adminReset: UnsignedSharedKey
     public let deviceKey: TrustDeviceResponse?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(privateKey: EncString, publicKey: String, adminReset: AsymmetricEncString, deviceKey: TrustDeviceResponse?) {
+    public init(privateKey: EncString, publicKey: B64, adminReset: UnsignedSharedKey, deviceKey: TrustDeviceResponse?) {
         self.privateKey = privateKey
         self.publicKey = publicKey
         self.adminReset = adminReset
         self.deviceKey = deviceKey
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension RegisterTdeKeyResponse: Sendable {}
+#endif
 
-
-extension RegisterTdeKeyResponse: Equatable, Hashable {
-    public static func ==(lhs: RegisterTdeKeyResponse, rhs: RegisterTdeKeyResponse) -> Bool {
-        if lhs.privateKey != rhs.privateKey {
-            return false
-        }
-        if lhs.publicKey != rhs.publicKey {
-            return false
-        }
-        if lhs.adminReset != rhs.adminReset {
-            return false
-        }
-        if lhs.deviceKey != rhs.deviceKey {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(privateKey)
-        hasher.combine(publicKey)
-        hasher.combine(adminReset)
-        hasher.combine(deviceKey)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeRegisterTdeKeyResponse: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RegisterTdeKeyResponse {
         return
             try RegisterTdeKeyResponse(
                 privateKey: FfiConverterTypeEncString.read(from: &buf), 
-                publicKey: FfiConverterString.read(from: &buf), 
-                adminReset: FfiConverterTypeAsymmetricEncString.read(from: &buf), 
+                publicKey: FfiConverterTypeB64.read(from: &buf), 
+                adminReset: FfiConverterTypeUnsignedSharedKey.read(from: &buf), 
                 deviceKey: FfiConverterOptionTypeTrustDeviceResponse.read(from: &buf)
         )
     }
 
     public static func write(_ value: RegisterTdeKeyResponse, into buf: inout [UInt8]) {
         FfiConverterTypeEncString.write(value.privateKey, into: &buf)
-        FfiConverterString.write(value.publicKey, into: &buf)
-        FfiConverterTypeAsymmetricEncString.write(value.adminReset, into: &buf)
+        FfiConverterTypeB64.write(value.publicKey, into: &buf)
+        FfiConverterTypeUnsignedSharedKey.write(value.adminReset, into: &buf)
         FfiConverterOptionTypeTrustDeviceResponse.write(value.deviceKey, into: &buf)
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeRegisterTdeKeyResponse_lift(_ buf: RustBuffer) throws -> RegisterTdeKeyResponse {
     return try FfiConverterTypeRegisterTdeKeyResponse.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeRegisterTdeKeyResponse_lower(_ value: RegisterTdeKeyResponse) -> RustBuffer {
     return FfiConverterTypeRegisterTdeKeyResponse.lower(value)
 }
 
 
-public struct UniffiConverterDummyRecord {
-    public let uuid: Uuid
-    public let date: DateTime
+/**
+ * State used to re-initialize an unlocked user's cryptographic state after
+ * `accountCryptographicState` and `V2UpgradeToken` are received in a sync.
+ *
+ * This presumes the SDK is already unlocked (has user key in memory).
+ */
+public struct ReinitUserCryptoRequest: Equatable, Hashable, Codable {
+    /**
+     * The user's account cryptographic state, encrypted under the user key
+     */
+    public let accountCryptographicState: WrappedAccountCryptographicState
+    /**
+     * The SDK uses the in-store (V1) user key to extract the V2 user key from the token,
+     * then sets the V2 user key as the active user key before decrypting
+     * `account_cryptographic_state`.
+     */
+    public let upgradeToken: V2UpgradeToken
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(uuid: Uuid, date: DateTime) {
+    public init(
+        /**
+         * The user's account cryptographic state, encrypted under the user key
+         */accountCryptographicState: WrappedAccountCryptographicState, 
+        /**
+         * The SDK uses the in-store (V1) user key to extract the V2 user key from the token,
+         * then sets the V2 user key as the active user key before decrypting
+         * `account_cryptographic_state`.
+         */upgradeToken: V2UpgradeToken) {
+        self.accountCryptographicState = accountCryptographicState
+        self.upgradeToken = upgradeToken
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ReinitUserCryptoRequest: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReinitUserCryptoRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReinitUserCryptoRequest {
+        return
+            try ReinitUserCryptoRequest(
+                accountCryptographicState: FfiConverterTypeWrappedAccountCryptographicState.read(from: &buf), 
+                upgradeToken: FfiConverterTypeV2UpgradeToken.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ReinitUserCryptoRequest, into buf: inout [UInt8]) {
+        FfiConverterTypeWrappedAccountCryptographicState.write(value.accountCryptographicState, into: &buf)
+        FfiConverterTypeV2UpgradeToken.write(value.upgradeToken, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReinitUserCryptoRequest_lift(_ buf: RustBuffer) throws -> ReinitUserCryptoRequest {
+    return try FfiConverterTypeReinitUserCryptoRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReinitUserCryptoRequest_lower(_ value: ReinitUserCryptoRequest) -> RustBuffer {
+    return FfiConverterTypeReinitUserCryptoRequest.lower(value)
+}
+
+
+/**
+ * Request to verify a user's secret.
+ */
+public struct SecretVerificationRequest: Equatable, Hashable, Codable {
+    /**
+     * The user's master password to use for user verification. If supplied, this will be used for
+     * verification purposes.
+     */
+    public let masterPassword: String?
+    /**
+     * Alternate user verification method through OTP. This is provided for users who have no
+     * master password due to use of Customer Managed Encryption. Must be present and valid if
+     * master_password is absent.
+     */
+    public let otp: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The user's master password to use for user verification. If supplied, this will be used for
+         * verification purposes.
+         */masterPassword: String?, 
+        /**
+         * Alternate user verification method through OTP. This is provided for users who have no
+         * master password due to use of Customer Managed Encryption. Must be present and valid if
+         * master_password is absent.
+         */otp: String?) {
+        self.masterPassword = masterPassword
+        self.otp = otp
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SecretVerificationRequest: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSecretVerificationRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SecretVerificationRequest {
+        return
+            try SecretVerificationRequest(
+                masterPassword: FfiConverterOptionString.read(from: &buf), 
+                otp: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SecretVerificationRequest, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.masterPassword, into: &buf)
+        FfiConverterOptionString.write(value.otp, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSecretVerificationRequest_lift(_ buf: RustBuffer) throws -> SecretVerificationRequest {
+    return try FfiConverterTypeSecretVerificationRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSecretVerificationRequest_lower(_ value: SecretVerificationRequest) -> RustBuffer {
+    return FfiConverterTypeSecretVerificationRequest.lower(value)
+}
+
+
+/**
+ * The security state is a signed object attesting to the security state of a user.
+ *
+ * It contains a version, which can only ever increment. Based on the version, old formats and
+ * features are blocked. This prevents a server from downgrading a user's account features, because
+ * only the user can create this signed object.
+ */
+public struct SecurityState: Equatable, Hashable, Codable {
+    /**
+     * The version of the security state gates feature availability. It can only ever be
+     * incremented. Components can use it to gate format support of specific formats (like
+     * item url hashes).
+     */
+    public let version: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The version of the security state gates feature availability. It can only ever be
+         * incremented. Components can use it to gate format support of specific formats (like
+         * item url hashes).
+         */version: UInt64) {
+        self.version = version
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SecurityState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSecurityState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SecurityState {
+        return
+            try SecurityState(
+                version: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SecurityState, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.version, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSecurityState_lift(_ buf: RustBuffer) throws -> SecurityState {
+    return try FfiConverterTypeSecurityState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSecurityState_lower(_ value: SecurityState) -> RustBuffer {
+    return FfiConverterTypeSecurityState.lower(value)
+}
+
+
+public struct UniffiConverterDummyRecord: Equatable, Hashable, Codable {
+    public let uuid: Uuid
+    public let date: DateTime
+    public let naiveDate: NaiveDate
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(uuid: Uuid, date: DateTime, naiveDate: NaiveDate) {
         self.uuid = uuid
         self.date = date
+        self.naiveDate = naiveDate
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension UniffiConverterDummyRecord: Sendable {}
+#endif
 
-
-extension UniffiConverterDummyRecord: Equatable, Hashable {
-    public static func ==(lhs: UniffiConverterDummyRecord, rhs: UniffiConverterDummyRecord) -> Bool {
-        if lhs.uuid != rhs.uuid {
-            return false
-        }
-        if lhs.date != rhs.date {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(uuid)
-        hasher.combine(date)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeUniffiConverterDummyRecord: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UniffiConverterDummyRecord {
         return
             try UniffiConverterDummyRecord(
                 uuid: FfiConverterTypeUuid.read(from: &buf), 
-                date: FfiConverterTypeDateTime.read(from: &buf)
+                date: FfiConverterTypeDateTime.read(from: &buf), 
+                naiveDate: FfiConverterTypeNaiveDate.read(from: &buf)
         )
     }
 
     public static func write(_ value: UniffiConverterDummyRecord, into buf: inout [UInt8]) {
         FfiConverterTypeUuid.write(value.uuid, into: &buf)
         FfiConverterTypeDateTime.write(value.date, into: &buf)
+        FfiConverterTypeNaiveDate.write(value.naiveDate, into: &buf)
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeUniffiConverterDummyRecord_lift(_ buf: RustBuffer) throws -> UniffiConverterDummyRecord {
     return try FfiConverterTypeUniffiConverterDummyRecord.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeUniffiConverterDummyRecord_lower(_ value: UniffiConverterDummyRecord) -> RustBuffer {
     return FfiConverterTypeUniffiConverterDummyRecord.lower(value)
 }
 
 
-public struct UpdatePasswordResponse {
+/**
+ * Response from the `update_kdf` function
+ *
+ * Note: This is deprecated and will be removed after key-connector fully uses sdk
+ */
+public struct UpdateKdfResponse: Equatable, Hashable, Codable {
+    /**
+     * The authentication data for the new KDF setting
+     */
+    public let masterPasswordAuthenticationData: MasterPasswordAuthenticationData
+    /**
+     * The unlock data for the new KDF setting
+     */
+    public let masterPasswordUnlockData: MasterPasswordUnlockData
+    /**
+     * The authentication data for the KDF setting prior to the change
+     */
+    public let oldMasterPasswordAuthenticationData: MasterPasswordAuthenticationData
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The authentication data for the new KDF setting
+         */masterPasswordAuthenticationData: MasterPasswordAuthenticationData, 
+        /**
+         * The unlock data for the new KDF setting
+         */masterPasswordUnlockData: MasterPasswordUnlockData, 
+        /**
+         * The authentication data for the KDF setting prior to the change
+         */oldMasterPasswordAuthenticationData: MasterPasswordAuthenticationData) {
+        self.masterPasswordAuthenticationData = masterPasswordAuthenticationData
+        self.masterPasswordUnlockData = masterPasswordUnlockData
+        self.oldMasterPasswordAuthenticationData = oldMasterPasswordAuthenticationData
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension UpdateKdfResponse: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUpdateKdfResponse: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UpdateKdfResponse {
+        return
+            try UpdateKdfResponse(
+                masterPasswordAuthenticationData: FfiConverterTypeMasterPasswordAuthenticationData.read(from: &buf), 
+                masterPasswordUnlockData: FfiConverterTypeMasterPasswordUnlockData.read(from: &buf), 
+                oldMasterPasswordAuthenticationData: FfiConverterTypeMasterPasswordAuthenticationData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: UpdateKdfResponse, into buf: inout [UInt8]) {
+        FfiConverterTypeMasterPasswordAuthenticationData.write(value.masterPasswordAuthenticationData, into: &buf)
+        FfiConverterTypeMasterPasswordUnlockData.write(value.masterPasswordUnlockData, into: &buf)
+        FfiConverterTypeMasterPasswordAuthenticationData.write(value.oldMasterPasswordAuthenticationData, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUpdateKdfResponse_lift(_ buf: RustBuffer) throws -> UpdateKdfResponse {
+    return try FfiConverterTypeUpdateKdfResponse.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUpdateKdfResponse_lower(_ value: UpdateKdfResponse) -> RustBuffer {
+    return FfiConverterTypeUpdateKdfResponse.lower(value)
+}
+
+
+/**
+ * Response from the `make_update_password` function
+ */
+public struct UpdatePasswordResponse: Equatable, Hashable, Codable {
     /**
      * Hash of the new password
      */
-    public let passwordHash: String
+    public let passwordHash: B64
     /**
      * User key, encrypted with the new password
      */
@@ -1456,80 +4891,648 @@ public struct UpdatePasswordResponse {
     public init(
         /**
          * Hash of the new password
-         */passwordHash: String, 
+         */passwordHash: B64, 
         /**
          * User key, encrypted with the new password
          */newKey: EncString) {
         self.passwordHash = passwordHash
         self.newKey = newKey
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension UpdatePasswordResponse: Sendable {}
+#endif
 
-
-extension UpdatePasswordResponse: Equatable, Hashable {
-    public static func ==(lhs: UpdatePasswordResponse, rhs: UpdatePasswordResponse) -> Bool {
-        if lhs.passwordHash != rhs.passwordHash {
-            return false
-        }
-        if lhs.newKey != rhs.newKey {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(passwordHash)
-        hasher.combine(newKey)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeUpdatePasswordResponse: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UpdatePasswordResponse {
         return
             try UpdatePasswordResponse(
-                passwordHash: FfiConverterString.read(from: &buf), 
+                passwordHash: FfiConverterTypeB64.read(from: &buf), 
                 newKey: FfiConverterTypeEncString.read(from: &buf)
         )
     }
 
     public static func write(_ value: UpdatePasswordResponse, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.passwordHash, into: &buf)
+        FfiConverterTypeB64.write(value.passwordHash, into: &buf)
         FfiConverterTypeEncString.write(value.newKey, into: &buf)
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeUpdatePasswordResponse_lift(_ buf: RustBuffer) throws -> UpdatePasswordResponse {
     return try FfiConverterTypeUpdatePasswordResponse.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeUpdatePasswordResponse_lower(_ value: UpdatePasswordResponse) -> RustBuffer {
     return FfiConverterTypeUpdatePasswordResponse.lower(value)
 }
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
-public enum AuthRequestMethod {
+/**
+ * Response for the `make_keys_for_user_crypto_v2`, containing a set of keys for a user
+ */
+public struct UserCryptoV2KeysResponse: Equatable, Hashable, Codable {
+    /**
+     * User key
+     */
+    public let userKey: B64
+    /**
+     * Wrapped private key
+     */
+    public let privateKey: EncString
+    /**
+     * Public key
+     */
+    public let publicKey: B64
+    /**
+     * The user's public key, signed by the signing key
+     */
+    public let signedPublicKey: SignedPublicKey
+    /**
+     * Signing key, encrypted with the user's symmetric key
+     */
+    public let signingKey: EncString
+    /**
+     * Base64 encoded verifying key
+     */
+    public let verifyingKey: B64
+    /**
+     * The user's signed security state
+     */
+    public let securityState: SignedSecurityState
+    /**
+     * The security state's version
+     */
+    public let securityVersion: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * User key
+         */userKey: B64, 
+        /**
+         * Wrapped private key
+         */privateKey: EncString, 
+        /**
+         * Public key
+         */publicKey: B64, 
+        /**
+         * The user's public key, signed by the signing key
+         */signedPublicKey: SignedPublicKey, 
+        /**
+         * Signing key, encrypted with the user's symmetric key
+         */signingKey: EncString, 
+        /**
+         * Base64 encoded verifying key
+         */verifyingKey: B64, 
+        /**
+         * The user's signed security state
+         */securityState: SignedSecurityState, 
+        /**
+         * The security state's version
+         */securityVersion: UInt64) {
+        self.userKey = userKey
+        self.privateKey = privateKey
+        self.publicKey = publicKey
+        self.signedPublicKey = signedPublicKey
+        self.signingKey = signingKey
+        self.verifyingKey = verifyingKey
+        self.securityState = securityState
+        self.securityVersion = securityVersion
+    }
+
     
+
+    
+}
+
+#if compiler(>=6)
+extension UserCryptoV2KeysResponse: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUserCryptoV2KeysResponse: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UserCryptoV2KeysResponse {
+        return
+            try UserCryptoV2KeysResponse(
+                userKey: FfiConverterTypeB64.read(from: &buf), 
+                privateKey: FfiConverterTypeEncString.read(from: &buf), 
+                publicKey: FfiConverterTypeB64.read(from: &buf), 
+                signedPublicKey: FfiConverterTypeSignedPublicKey.read(from: &buf), 
+                signingKey: FfiConverterTypeEncString.read(from: &buf), 
+                verifyingKey: FfiConverterTypeB64.read(from: &buf), 
+                securityState: FfiConverterTypeSignedSecurityState.read(from: &buf), 
+                securityVersion: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: UserCryptoV2KeysResponse, into buf: inout [UInt8]) {
+        FfiConverterTypeB64.write(value.userKey, into: &buf)
+        FfiConverterTypeEncString.write(value.privateKey, into: &buf)
+        FfiConverterTypeB64.write(value.publicKey, into: &buf)
+        FfiConverterTypeSignedPublicKey.write(value.signedPublicKey, into: &buf)
+        FfiConverterTypeEncString.write(value.signingKey, into: &buf)
+        FfiConverterTypeB64.write(value.verifyingKey, into: &buf)
+        FfiConverterTypeSignedSecurityState.write(value.securityState, into: &buf)
+        FfiConverterUInt64.write(value.securityVersion, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUserCryptoV2KeysResponse_lift(_ buf: RustBuffer) throws -> UserCryptoV2KeysResponse {
+    return try FfiConverterTypeUserCryptoV2KeysResponse.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUserCryptoV2KeysResponse_lower(_ value: UserCryptoV2KeysResponse) -> RustBuffer {
+    return FfiConverterTypeUserCryptoV2KeysResponse.lower(value)
+}
+
+
+/**
+ * Holds both V1 and V2 user keys, each wrapped by the other.
+ */
+public struct V2UpgradeToken: Equatable, Hashable, Codable {
+    /**
+     * V1 user key encrypted with V2 key (Cose_Encrypt0_B64 format)
+     */
+    public let wrappedUserKey1: EncString
+    /**
+     * V2 user key encrypted with V1 key (Aes256Cbc_HmacSha256_B64 format)
+     */
+    public let wrappedUserKey2: EncString
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * V1 user key encrypted with V2 key (Cose_Encrypt0_B64 format)
+         */wrappedUserKey1: EncString, 
+        /**
+         * V2 user key encrypted with V1 key (Aes256Cbc_HmacSha256_B64 format)
+         */wrappedUserKey2: EncString) {
+        self.wrappedUserKey1 = wrappedUserKey1
+        self.wrappedUserKey2 = wrappedUserKey2
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension V2UpgradeToken: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeV2UpgradeToken: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> V2UpgradeToken {
+        return
+            try V2UpgradeToken(
+                wrappedUserKey1: FfiConverterTypeEncString.read(from: &buf), 
+                wrappedUserKey2: FfiConverterTypeEncString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: V2UpgradeToken, into buf: inout [UInt8]) {
+        FfiConverterTypeEncString.write(value.wrappedUserKey1, into: &buf)
+        FfiConverterTypeEncString.write(value.wrappedUserKey2, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeV2UpgradeToken_lift(_ buf: RustBuffer) throws -> V2UpgradeToken {
+    return try FfiConverterTypeV2UpgradeToken.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeV2UpgradeToken_lower(_ value: V2UpgradeToken) -> RustBuffer {
+    return FfiConverterTypeV2UpgradeToken.lower(value)
+}
+
+
+/**
+ * Every WebAuthn PRF credential the account can unlock with.
+ */
+public struct WebAuthnPrfUnlockData: Equatable, Hashable, Codable {
+    /**
+     * The credentials, in the order the server reported them.
+     */
+    public let options: [WebAuthnPrfUnlockOption]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The credentials, in the order the server reported them.
+         */options: [WebAuthnPrfUnlockOption]) {
+        self.options = options
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension WebAuthnPrfUnlockData: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWebAuthnPrfUnlockData: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WebAuthnPrfUnlockData {
+        return
+            try WebAuthnPrfUnlockData(
+                options: FfiConverterSequenceTypeWebAuthnPrfUnlockOption.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WebAuthnPrfUnlockData, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeWebAuthnPrfUnlockOption.write(value.options, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWebAuthnPrfUnlockData_lift(_ buf: RustBuffer) throws -> WebAuthnPrfUnlockData {
+    return try FfiConverterTypeWebAuthnPrfUnlockData.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWebAuthnPrfUnlockData_lower(_ value: WebAuthnPrfUnlockData) -> RustBuffer {
+    return FfiConverterTypeWebAuthnPrfUnlockData.lower(value)
+}
+
+
+/**
+ * The unlock data for a single WebAuthn PRF credential.
+ */
+public struct WebAuthnPrfUnlockOption: Equatable, Hashable, Codable {
+    /**
+     * The private key of the unlock option, wrapped by the key derived from the credential's PRF
+     * output
+     */
+    public let encryptedPrivateKey: EncString
+    /**
+     * The user key, encapsulated with the public key of the unlock option
+     */
+    public let encryptedUserKey: UnsignedSharedKey
+    /**
+     * Credential ID for this WebAuthn PRF credential.
+     */
+    public let credentialId: String?
+    /**
+     * Transport methods available for this credential (e.g., "usb", "nfc", "ble", "internal",
+     * "hybrid").
+     */
+    public let transports: [String]?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The private key of the unlock option, wrapped by the key derived from the credential's PRF
+         * output
+         */encryptedPrivateKey: EncString, 
+        /**
+         * The user key, encapsulated with the public key of the unlock option
+         */encryptedUserKey: UnsignedSharedKey, 
+        /**
+         * Credential ID for this WebAuthn PRF credential.
+         */credentialId: String?, 
+        /**
+         * Transport methods available for this credential (e.g., "usb", "nfc", "ble", "internal",
+         * "hybrid").
+         */transports: [String]?) {
+        self.encryptedPrivateKey = encryptedPrivateKey
+        self.encryptedUserKey = encryptedUserKey
+        self.credentialId = credentialId
+        self.transports = transports
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension WebAuthnPrfUnlockOption: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWebAuthnPrfUnlockOption: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WebAuthnPrfUnlockOption {
+        return
+            try WebAuthnPrfUnlockOption(
+                encryptedPrivateKey: FfiConverterTypeEncString.read(from: &buf), 
+                encryptedUserKey: FfiConverterTypeUnsignedSharedKey.read(from: &buf), 
+                credentialId: FfiConverterOptionString.read(from: &buf), 
+                transports: FfiConverterOptionSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WebAuthnPrfUnlockOption, into buf: inout [UInt8]) {
+        FfiConverterTypeEncString.write(value.encryptedPrivateKey, into: &buf)
+        FfiConverterTypeUnsignedSharedKey.write(value.encryptedUserKey, into: &buf)
+        FfiConverterOptionString.write(value.credentialId, into: &buf)
+        FfiConverterOptionSequenceString.write(value.transports, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWebAuthnPrfUnlockOption_lift(_ buf: RustBuffer) throws -> WebAuthnPrfUnlockOption {
+    return try FfiConverterTypeWebAuthnPrfUnlockOption.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWebAuthnPrfUnlockOption_lower(_ value: WebAuthnPrfUnlockOption) -> RustBuffer {
+    return FfiConverterTypeWebAuthnPrfUnlockOption.lower(value)
+}
+
+
+/**
+ * Errors that can occur during initialization of the account cryptographic state.
+ */
+public 
+enum AccountCryptographyInitializationError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
+    
+    
+    /**
+     * The encryption algorithm from the user key does not match one of the encrypted items.
+     * This would mean that the user's account is corrupt.
+     */
+    case WrongUserKeyType(message: String)
+    
+    /**
+     * The provide user-key is incorrect or out-of-date. This may happen when a use-key changed
+     * and a local unlock-method is not yet updated.
+     */
+    case WrongUserKey(message: String)
+    
+    /**
+     * The decrypted data is corrupt.
+     */
+    case CorruptData(message: String)
+    
+    /**
+     * The decrypted data is corrupt.
+     */
+    case TamperedData(message: String)
+    
+    /**
+     * A generic cryptographic error occurred.
+     */
+    case GenericCrypto(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension AccountCryptographyInitializationError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAccountCryptographyInitializationError: FfiConverterRustBuffer {
+    typealias SwiftType = AccountCryptographyInitializationError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AccountCryptographyInitializationError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .WrongUserKeyType(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .WrongUserKey(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .CorruptData(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .TamperedData(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 5: return .GenericCrypto(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: AccountCryptographyInitializationError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .WrongUserKeyType(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+        case .WrongUserKey(_ /* message is ignored*/):
+            writeInt(&buf, Int32(2))
+        case .CorruptData(_ /* message is ignored*/):
+            writeInt(&buf, Int32(3))
+        case .TamperedData(_ /* message is ignored*/):
+            writeInt(&buf, Int32(4))
+        case .GenericCrypto(_ /* message is ignored*/):
+            writeInt(&buf, Int32(5))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAccountCryptographyInitializationError_lift(_ buf: RustBuffer) throws -> AccountCryptographyInitializationError {
+    return try FfiConverterTypeAccountCryptographyInitializationError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAccountCryptographyInitializationError_lower(_ value: AccountCryptographyInitializationError) -> RustBuffer {
+    return FfiConverterTypeAccountCryptographyInitializationError.lower(value)
+}
+
+
+public 
+enum ApproveAuthRequestError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
+    
+    
+    case Crypto(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension ApproveAuthRequestError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeApproveAuthRequestError: FfiConverterRustBuffer {
+    typealias SwiftType = ApproveAuthRequestError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ApproveAuthRequestError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .Crypto(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ApproveAuthRequestError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .Crypto(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeApproveAuthRequestError_lift(_ buf: RustBuffer) throws -> ApproveAuthRequestError {
+    return try FfiConverterTypeApproveAuthRequestError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeApproveAuthRequestError_lower(_ value: ApproveAuthRequestError) -> RustBuffer {
+    return FfiConverterTypeApproveAuthRequestError.lower(value)
+}
+
+
+/**
+ * Auth requests supports multiple initialization methods.
+ */
+
+public enum AuthRequestMethod: Equatable, Hashable, Codable {
+    
+    /**
+     * User Key
+     */
     case userKey(
         /**
          * User Key protected by the private key provided in `AuthRequestResponse`.
-         */protectedUserKey: AsymmetricEncString
+         */protectedUserKey: UnsignedSharedKey
     )
+    /**
+     * Master Key
+     */
     case masterKey(
         /**
          * Master Key protected by the private key provided in `AuthRequestResponse`.
-         */protectedMasterKey: AsymmetricEncString, 
+         */protectedMasterKey: UnsignedSharedKey, 
         /**
          * User Key protected by the MasterKey, provided by the auth response.
          */authRequestKey: EncString
     )
+
+
+
+
+
 }
 
+#if compiler(>=6)
+extension AuthRequestMethod: Sendable {}
+#endif
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeAuthRequestMethod: FfiConverterRustBuffer {
     typealias SwiftType = AuthRequestMethod
 
@@ -1537,10 +5540,10 @@ public struct FfiConverterTypeAuthRequestMethod: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .userKey(protectedUserKey: try FfiConverterTypeAsymmetricEncString.read(from: &buf)
+        case 1: return .userKey(protectedUserKey: try FfiConverterTypeUnsignedSharedKey.read(from: &buf)
         )
         
-        case 2: return .masterKey(protectedMasterKey: try FfiConverterTypeAsymmetricEncString.read(from: &buf), authRequestKey: try FfiConverterTypeEncString.read(from: &buf)
+        case 2: return .masterKey(protectedMasterKey: try FfiConverterTypeUnsignedSharedKey.read(from: &buf), authRequestKey: try FfiConverterTypeEncString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1553,12 +5556,12 @@ public struct FfiConverterTypeAuthRequestMethod: FfiConverterRustBuffer {
         
         case let .userKey(protectedUserKey):
             writeInt(&buf, Int32(1))
-            FfiConverterTypeAsymmetricEncString.write(protectedUserKey, into: &buf)
+            FfiConverterTypeUnsignedSharedKey.write(protectedUserKey, into: &buf)
             
         
         case let .masterKey(protectedMasterKey,authRequestKey):
             writeInt(&buf, Int32(2))
-            FfiConverterTypeAsymmetricEncString.write(protectedMasterKey, into: &buf)
+            FfiConverterTypeUnsignedSharedKey.write(protectedMasterKey, into: &buf)
             FfiConverterTypeEncString.write(authRequestKey, into: &buf)
             
         }
@@ -1566,24 +5569,343 @@ public struct FfiConverterTypeAuthRequestMethod: FfiConverterRustBuffer {
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeAuthRequestMethod_lift(_ buf: RustBuffer) throws -> AuthRequestMethod {
     return try FfiConverterTypeAuthRequestMethod.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeAuthRequestMethod_lower(_ value: AuthRequestMethod) -> RustBuffer {
     return FfiConverterTypeAuthRequestMethod.lower(value)
 }
 
 
 
-extension AuthRequestMethod: Equatable, Hashable {}
+/**
+ * Error for authentication related operations
+ */
+public 
+enum AuthValidateError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
+    
+    
+    case NotAuthenticated(message: String)
+    
+    case WrongPassword(message: String)
+    
+    case WrongUserKey(message: String)
+    
+    case Crypto(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension AuthValidateError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAuthValidateError: FfiConverterRustBuffer {
+    typealias SwiftType = AuthValidateError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AuthValidateError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .NotAuthenticated(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .WrongPassword(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .WrongUserKey(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .Crypto(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: AuthValidateError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .NotAuthenticated(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+        case .WrongPassword(_ /* message is ignored*/):
+            writeInt(&buf, Int32(2))
+        case .WrongUserKey(_ /* message is ignored*/):
+            writeInt(&buf, Int32(3))
+        case .Crypto(_ /* message is ignored*/):
+            writeInt(&buf, Int32(4))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAuthValidateError_lift(_ buf: RustBuffer) throws -> AuthValidateError {
+    return try FfiConverterTypeAuthValidateError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAuthValidateError_lower(_ value: AuthValidateError) -> RustBuffer {
+    return FfiConverterTypeAuthValidateError.lower(value)
+}
+
+
+/**
+ * Catch all error for mobile crypto operations.
+ */
+public 
+enum CryptoClientError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
+    
+    
+    case NotAuthenticated(message: String)
+    
+    case Crypto(message: String)
+    
+    case InvalidKdfSettings(message: String)
+    
+    case PasswordProtectedKeyEnvelope(message: String)
+    
+    case InvalidPrfInput(message: String)
+    
+    case InvalidUpgradeToken(message: String)
+    
+    case UpgradeTokenRequired(message: String)
+    
+    case InvalidKeyType(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension CryptoClientError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCryptoClientError: FfiConverterRustBuffer {
+    typealias SwiftType = CryptoClientError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CryptoClientError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .NotAuthenticated(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .Crypto(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .InvalidKdfSettings(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .PasswordProtectedKeyEnvelope(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 5: return .InvalidPrfInput(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 6: return .InvalidUpgradeToken(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 7: return .UpgradeTokenRequired(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 8: return .InvalidKeyType(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CryptoClientError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .NotAuthenticated(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+        case .Crypto(_ /* message is ignored*/):
+            writeInt(&buf, Int32(2))
+        case .InvalidKdfSettings(_ /* message is ignored*/):
+            writeInt(&buf, Int32(3))
+        case .PasswordProtectedKeyEnvelope(_ /* message is ignored*/):
+            writeInt(&buf, Int32(4))
+        case .InvalidPrfInput(_ /* message is ignored*/):
+            writeInt(&buf, Int32(5))
+        case .InvalidUpgradeToken(_ /* message is ignored*/):
+            writeInt(&buf, Int32(6))
+        case .UpgradeTokenRequired(_ /* message is ignored*/):
+            writeInt(&buf, Int32(7))
+        case .InvalidKeyType(_ /* message is ignored*/):
+            writeInt(&buf, Int32(8))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCryptoClientError_lift(_ buf: RustBuffer) throws -> CryptoClientError {
+    return try FfiConverterTypeCryptoClientError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCryptoClientError_lower(_ value: CryptoClientError) -> RustBuffer {
+    return FfiConverterTypeCryptoClientError.lower(value)
+}
+
+
+public 
+enum DeriveKeyConnectorError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
+    
+    
+    case WrongPassword(message: String)
+    
+    case Crypto(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension DeriveKeyConnectorError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeriveKeyConnectorError: FfiConverterRustBuffer {
+    typealias SwiftType = DeriveKeyConnectorError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeriveKeyConnectorError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .WrongPassword(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .Crypto(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: DeriveKeyConnectorError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .WrongPassword(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+        case .Crypto(_ /* message is ignored*/):
+            writeInt(&buf, Int32(2))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeriveKeyConnectorError_lift(_ buf: RustBuffer) throws -> DeriveKeyConnectorError {
+    return try FfiConverterTypeDeriveKeyConnectorError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeriveKeyConnectorError_lower(_ value: DeriveKeyConnectorError) -> RustBuffer {
+    return FfiConverterTypeDeriveKeyConnectorError.lower(value)
+}
 
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-
-public enum DeviceType {
+public enum DeviceType: Equatable, Hashable, Codable {
     
     case android
     case iOs
@@ -1607,9 +5929,25 @@ public enum DeviceType {
     case vivaldiExtension
     case safariExtension
     case sdk
+    case server
+    case windowsCli
+    case macOsCli
+    case linuxCli
+    case duckDuckGoBrowser
+
+
+
+
+
 }
 
+#if compiler(>=6)
+extension DeviceType: Sendable {}
+#endif
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeDeviceType: FfiConverterRustBuffer {
     typealias SwiftType = DeviceType
 
@@ -1660,6 +5998,16 @@ public struct FfiConverterTypeDeviceType: FfiConverterRustBuffer {
         case 21: return .safariExtension
         
         case 22: return .sdk
+        
+        case 23: return .server
+        
+        case 24: return .windowsCli
+        
+        case 25: return .macOsCli
+        
+        case 26: return .linuxCli
+        
+        case 27: return .duckDuckGoBrowser
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1756,43 +6104,406 @@ public struct FfiConverterTypeDeviceType: FfiConverterRustBuffer {
         case .sdk:
             writeInt(&buf, Int32(22))
         
+        
+        case .server:
+            writeInt(&buf, Int32(23))
+        
+        
+        case .windowsCli:
+            writeInt(&buf, Int32(24))
+        
+        
+        case .macOsCli:
+            writeInt(&buf, Int32(25))
+        
+        
+        case .linuxCli:
+            writeInt(&buf, Int32(26))
+        
+        
+        case .duckDuckGoBrowser:
+            writeInt(&buf, Int32(27))
+        
         }
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeDeviceType_lift(_ buf: RustBuffer) throws -> DeviceType {
     return try FfiConverterTypeDeviceType.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeDeviceType_lower(_ value: DeviceType) -> RustBuffer {
     return FfiConverterTypeDeviceType.lower(value)
 }
 
 
 
-extension DeviceType: Equatable, Hashable {}
+public 
+enum EncryptionSettingsError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
 
-
-
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-
-public enum InitUserCryptoMethod {
     
-    case password(
+    
+    case Crypto(message: String)
+    
+    case CryptoInitialization(message: String)
+    
+    case MissingPrivateKey(message: String)
+    
+    case UserIdAlreadySet(message: String)
+    
+    case WrongPin(message: String)
+    
+    /**
+     * The user-key could not be set to the state, and the sdk will remain locked
+     */
+    case UserKeyStateUpdateFailed(message: String)
+    
+    case UserKeyStateRetrievalFailed(message: String)
+    
+    case InvalidUpgradeToken(message: String)
+    
+    /**
+     * Retrieval of the key-connector-key from key-connector failed
+     */
+    case KeyConnectorRetrievalFailed(message: String)
+    
+    /**
+     * The local user data key could not be initialized.
+     */
+    case LocalUserDataKeyInitFailed(message: String)
+    
+    /**
+     * The local user data key could not be loaded into the key store context.
+     */
+    case LocalUserDataKeyLoadFailed(message: String)
+    
+    /**
+     * The migration (re-wrap) of the local user data key failed after a user key upgrade
+     */
+    case LocalUserDataMigrationFailed(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension EncryptionSettingsError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEncryptionSettingsError: FfiConverterRustBuffer {
+    typealias SwiftType = EncryptionSettingsError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EncryptionSettingsError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .Crypto(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .CryptoInitialization(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .MissingPrivateKey(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .UserIdAlreadySet(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 5: return .WrongPin(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 6: return .UserKeyStateUpdateFailed(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 7: return .UserKeyStateRetrievalFailed(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 8: return .InvalidUpgradeToken(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 9: return .KeyConnectorRetrievalFailed(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 10: return .LocalUserDataKeyInitFailed(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 11: return .LocalUserDataKeyLoadFailed(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 12: return .LocalUserDataMigrationFailed(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: EncryptionSettingsError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .Crypto(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+        case .CryptoInitialization(_ /* message is ignored*/):
+            writeInt(&buf, Int32(2))
+        case .MissingPrivateKey(_ /* message is ignored*/):
+            writeInt(&buf, Int32(3))
+        case .UserIdAlreadySet(_ /* message is ignored*/):
+            writeInt(&buf, Int32(4))
+        case .WrongPin(_ /* message is ignored*/):
+            writeInt(&buf, Int32(5))
+        case .UserKeyStateUpdateFailed(_ /* message is ignored*/):
+            writeInt(&buf, Int32(6))
+        case .UserKeyStateRetrievalFailed(_ /* message is ignored*/):
+            writeInt(&buf, Int32(7))
+        case .InvalidUpgradeToken(_ /* message is ignored*/):
+            writeInt(&buf, Int32(8))
+        case .KeyConnectorRetrievalFailed(_ /* message is ignored*/):
+            writeInt(&buf, Int32(9))
+        case .LocalUserDataKeyInitFailed(_ /* message is ignored*/):
+            writeInt(&buf, Int32(10))
+        case .LocalUserDataKeyLoadFailed(_ /* message is ignored*/):
+            writeInt(&buf, Int32(11))
+        case .LocalUserDataMigrationFailed(_ /* message is ignored*/):
+            writeInt(&buf, Int32(12))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEncryptionSettingsError_lift(_ buf: RustBuffer) throws -> EncryptionSettingsError {
+    return try FfiConverterTypeEncryptionSettingsError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEncryptionSettingsError_lower(_ value: EncryptionSettingsError) -> RustBuffer {
+    return FfiConverterTypeEncryptionSettingsError.lower(value)
+}
+
+
+public 
+enum EnrollAdminPasswordResetError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
+    
+    
+    case Crypto(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension EnrollAdminPasswordResetError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEnrollAdminPasswordResetError: FfiConverterRustBuffer {
+    typealias SwiftType = EnrollAdminPasswordResetError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EnrollAdminPasswordResetError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .Crypto(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: EnrollAdminPasswordResetError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .Crypto(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEnrollAdminPasswordResetError_lift(_ buf: RustBuffer) throws -> EnrollAdminPasswordResetError {
+    return try FfiConverterTypeEnrollAdminPasswordResetError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEnrollAdminPasswordResetError_lower(_ value: EnrollAdminPasswordResetError) -> RustBuffer {
+    return FfiConverterTypeEnrollAdminPasswordResetError.lower(value)
+}
+
+
+/**
+ * Errors that can occur when computing a fingerprint.
+ */
+public 
+enum FingerprintError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
+    
+    
+    case Crypto(CryptoError
+    )
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension FingerprintError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFingerprintError: FfiConverterRustBuffer {
+    typealias SwiftType = FingerprintError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FingerprintError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .Crypto(
+            try FfiConverterTypeCryptoError.read(from: &buf)
+            )
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FingerprintError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        
+        case let .Crypto(v1):
+            writeInt(&buf, Int32(1))
+            FfiConverterTypeCryptoError.write(v1, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFingerprintError_lift(_ buf: RustBuffer) throws -> FingerprintError {
+    return try FfiConverterTypeFingerprintError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFingerprintError_lower(_ value: FingerprintError) -> RustBuffer {
+    return FfiConverterTypeFingerprintError.lower(value)
+}
+
+
+/**
+ * The crypto method used to initialize the user cryptographic state.
+ */
+
+public enum InitUserCryptoMethod: Equatable, Hashable, Codable {
+    
+    /**
+     * Master Password Unlock
+     */
+    case masterPasswordUnlock(
         /**
          * The user's master password
          */password: String, 
         /**
-         * The user's encrypted symmetric crypto key
-         */userKey: String
+         * Contains the data needed to unlock with the master password
+         */masterPasswordUnlock: MasterPasswordUnlockData
     )
+    /**
+     * Never lock and/or biometric unlock
+     */
     case decryptedKey(
         /**
          * The user's decrypted encryption key, obtained using `get_user_encryption_key`
          */decryptedUserKey: String
     )
+    /**
+     * PIN
+     */
     case pin(
         /**
          * The user's PIN
@@ -1802,11 +6513,39 @@ public enum InitUserCryptoMethod {
          * this.
          */pinProtectedUserKey: EncString
     )
+    /**
+     * PIN state, where the PIN envelope is stored in persistent client-managed state
+     */
+    case pinState(
+        /**
+         * The user's PIN
+         */pin: String
+    )
+    /**
+     * PIN Envelope
+     */
+    case pinEnvelope(
+        /**
+         * The user's PIN
+         */pin: String, 
+        /**
+         * The user's symmetric crypto key, encrypted with the PIN-protected key envelope.
+         */pinProtectedUserKeyEnvelope: PasswordProtectedKeyEnvelope
+    )
+    /**
+     * Auth request
+     */
     case authRequest(
         /**
          * Private Key generated by the `crate::auth::new_auth_request`.
-         */requestPrivateKey: String, method: AuthRequestMethod
+         */requestPrivateKey: B64, 
+        /**
+         * The type of auth request
+         */method: AuthRequestMethod
     )
+    /**
+     * Device Key
+     */
     case deviceKey(
         /**
          * The device's DeviceKey
@@ -1816,19 +6555,44 @@ public enum InitUserCryptoMethod {
          */protectedDevicePrivateKey: EncString, 
         /**
          * The user's symmetric crypto key, encrypted with the Device Key.
-         */deviceProtectedUserKey: AsymmetricEncString
+         */deviceProtectedUserKey: UnsignedSharedKey
     )
+    /**
+     * Key connector
+     */
     case keyConnector(
         /**
          * Base64 encoded master key, retrieved from the key connector.
-         */masterKey: String, 
+         */masterKey: B64, 
         /**
          * The user's encrypted symmetric crypto key
-         */userKey: String
+         */userKey: EncString
     )
+    /**
+     * In contrast to key-connector, this does all of the connection with key-connector in the sdk
+     */
+    case keyConnectorUrl(
+        /**
+         * The url to retrieve the key-connector-key from
+         */url: String, 
+        /**
+         * The encrypted user key, encrypted with the key connector key retrieved from the url
+         */keyConnectorKeyWrappedUserKey: EncString
+    )
+
+
+
+
+
 }
 
+#if compiler(>=6)
+extension InitUserCryptoMethod: Sendable {}
+#endif
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeInitUserCryptoMethod: FfiConverterRustBuffer {
     typealias SwiftType = InitUserCryptoMethod
 
@@ -1836,7 +6600,7 @@ public struct FfiConverterTypeInitUserCryptoMethod: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .password(password: try FfiConverterString.read(from: &buf), userKey: try FfiConverterString.read(from: &buf)
+        case 1: return .masterPasswordUnlock(password: try FfiConverterString.read(from: &buf), masterPasswordUnlock: try FfiConverterTypeMasterPasswordUnlockData.read(from: &buf)
         )
         
         case 2: return .decryptedKey(decryptedUserKey: try FfiConverterString.read(from: &buf)
@@ -1845,13 +6609,22 @@ public struct FfiConverterTypeInitUserCryptoMethod: FfiConverterRustBuffer {
         case 3: return .pin(pin: try FfiConverterString.read(from: &buf), pinProtectedUserKey: try FfiConverterTypeEncString.read(from: &buf)
         )
         
-        case 4: return .authRequest(requestPrivateKey: try FfiConverterString.read(from: &buf), method: try FfiConverterTypeAuthRequestMethod.read(from: &buf)
+        case 4: return .pinState(pin: try FfiConverterString.read(from: &buf)
         )
         
-        case 5: return .deviceKey(deviceKey: try FfiConverterString.read(from: &buf), protectedDevicePrivateKey: try FfiConverterTypeEncString.read(from: &buf), deviceProtectedUserKey: try FfiConverterTypeAsymmetricEncString.read(from: &buf)
+        case 5: return .pinEnvelope(pin: try FfiConverterString.read(from: &buf), pinProtectedUserKeyEnvelope: try FfiConverterTypePasswordProtectedKeyEnvelope.read(from: &buf)
         )
         
-        case 6: return .keyConnector(masterKey: try FfiConverterString.read(from: &buf), userKey: try FfiConverterString.read(from: &buf)
+        case 6: return .authRequest(requestPrivateKey: try FfiConverterTypeB64.read(from: &buf), method: try FfiConverterTypeAuthRequestMethod.read(from: &buf)
+        )
+        
+        case 7: return .deviceKey(deviceKey: try FfiConverterString.read(from: &buf), protectedDevicePrivateKey: try FfiConverterTypeEncString.read(from: &buf), deviceProtectedUserKey: try FfiConverterTypeUnsignedSharedKey.read(from: &buf)
+        )
+        
+        case 8: return .keyConnector(masterKey: try FfiConverterTypeB64.read(from: &buf), userKey: try FfiConverterTypeEncString.read(from: &buf)
+        )
+        
+        case 9: return .keyConnectorUrl(url: try FfiConverterString.read(from: &buf), keyConnectorKeyWrappedUserKey: try FfiConverterTypeEncString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1862,10 +6635,10 @@ public struct FfiConverterTypeInitUserCryptoMethod: FfiConverterRustBuffer {
         switch value {
         
         
-        case let .password(password,userKey):
+        case let .masterPasswordUnlock(password,masterPasswordUnlock):
             writeInt(&buf, Int32(1))
             FfiConverterString.write(password, into: &buf)
-            FfiConverterString.write(userKey, into: &buf)
+            FfiConverterTypeMasterPasswordUnlockData.write(masterPasswordUnlock, into: &buf)
             
         
         case let .decryptedKey(decryptedUserKey):
@@ -1879,43 +6652,1188 @@ public struct FfiConverterTypeInitUserCryptoMethod: FfiConverterRustBuffer {
             FfiConverterTypeEncString.write(pinProtectedUserKey, into: &buf)
             
         
-        case let .authRequest(requestPrivateKey,method):
+        case let .pinState(pin):
             writeInt(&buf, Int32(4))
-            FfiConverterString.write(requestPrivateKey, into: &buf)
+            FfiConverterString.write(pin, into: &buf)
+            
+        
+        case let .pinEnvelope(pin,pinProtectedUserKeyEnvelope):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(pin, into: &buf)
+            FfiConverterTypePasswordProtectedKeyEnvelope.write(pinProtectedUserKeyEnvelope, into: &buf)
+            
+        
+        case let .authRequest(requestPrivateKey,method):
+            writeInt(&buf, Int32(6))
+            FfiConverterTypeB64.write(requestPrivateKey, into: &buf)
             FfiConverterTypeAuthRequestMethod.write(method, into: &buf)
             
         
         case let .deviceKey(deviceKey,protectedDevicePrivateKey,deviceProtectedUserKey):
-            writeInt(&buf, Int32(5))
+            writeInt(&buf, Int32(7))
             FfiConverterString.write(deviceKey, into: &buf)
             FfiConverterTypeEncString.write(protectedDevicePrivateKey, into: &buf)
-            FfiConverterTypeAsymmetricEncString.write(deviceProtectedUserKey, into: &buf)
+            FfiConverterTypeUnsignedSharedKey.write(deviceProtectedUserKey, into: &buf)
             
         
         case let .keyConnector(masterKey,userKey):
-            writeInt(&buf, Int32(6))
-            FfiConverterString.write(masterKey, into: &buf)
-            FfiConverterString.write(userKey, into: &buf)
+            writeInt(&buf, Int32(8))
+            FfiConverterTypeB64.write(masterKey, into: &buf)
+            FfiConverterTypeEncString.write(userKey, into: &buf)
+            
+        
+        case let .keyConnectorUrl(url,keyConnectorKeyWrappedUserKey):
+            writeInt(&buf, Int32(9))
+            FfiConverterString.write(url, into: &buf)
+            FfiConverterTypeEncString.write(keyConnectorKeyWrappedUserKey, into: &buf)
             
         }
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeInitUserCryptoMethod_lift(_ buf: RustBuffer) throws -> InitUserCryptoMethod {
     return try FfiConverterTypeInitUserCryptoMethod.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeInitUserCryptoMethod_lower(_ value: InitUserCryptoMethod) -> RustBuffer {
     return FfiConverterTypeInitUserCryptoMethod.lower(value)
 }
 
 
 
-extension InitUserCryptoMethod: Equatable, Hashable {}
+/**
+ * Errors that can occur when making keys for account cryptography registration.
+ */
+public 
+enum MakeKeysError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
+    
+    
+    /**
+     * Failed to initialize account cryptography
+     */
+    case AccountCryptographyInitialization(message: String)
+    
+    /**
+     * Failed to derive master password
+     */
+    case MasterPasswordDerivation(message: String)
+    
+    /**
+     * Failed to create request model
+     */
+    case RequestModelCreation(message: String)
+    
+    /**
+     * Generic crypto error
+     */
+    case Crypto(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension MakeKeysError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMakeKeysError: FfiConverterRustBuffer {
+    typealias SwiftType = MakeKeysError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MakeKeysError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .AccountCryptographyInitialization(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .MasterPasswordDerivation(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .RequestModelCreation(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .Crypto(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MakeKeysError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .AccountCryptographyInitialization(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+        case .MasterPasswordDerivation(_ /* message is ignored*/):
+            writeInt(&buf, Int32(2))
+        case .RequestModelCreation(_ /* message is ignored*/):
+            writeInt(&buf, Int32(3))
+        case .Crypto(_ /* message is ignored*/):
+            writeInt(&buf, Int32(4))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMakeKeysError_lift(_ buf: RustBuffer) throws -> MakeKeysError {
+    return try FfiConverterTypeMakeKeysError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMakeKeysError_lower(_ value: MakeKeysError) -> RustBuffer {
+    return FfiConverterTypeMakeKeysError.lower(value)
+}
+
+
+/**
+ * Error for master password related operations.
+ */
+public 
+enum MasterPasswordError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
+    
+    
+    /**
+     * The wrapped encryption key could not be parsed because the encstring is malformed
+     */
+    case EncryptionKeyMalformed(message: String)
+    
+    /**
+     * The KDF data could not be parsed, because it has an invalid value
+     */
+    case KdfMalformed(message: String)
+    
+    /**
+     * The KDF had an invalid configuration
+     */
+    case InvalidKdfConfiguration(message: String)
+    
+    /**
+     * The contained key id could not be parsed, because it has an invalid value
+     */
+    case KeyIdMalformed(message: String)
+    
+    /**
+     * The wrapped encryption key or salt fields are missing or KDF data is incomplete
+     */
+    case MissingField(message: String)
+    
+    /**
+     * Generic crypto error
+     */
+    case Crypto(message: String)
+    
+    /**
+     * The provided password is incorrect
+     */
+    case WrongPassword(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension MasterPasswordError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMasterPasswordError: FfiConverterRustBuffer {
+    typealias SwiftType = MasterPasswordError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MasterPasswordError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .EncryptionKeyMalformed(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .KdfMalformed(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .InvalidKdfConfiguration(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .KeyIdMalformed(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 5: return .MissingField(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 6: return .Crypto(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 7: return .WrongPassword(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MasterPasswordError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .EncryptionKeyMalformed(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+        case .KdfMalformed(_ /* message is ignored*/):
+            writeInt(&buf, Int32(2))
+        case .InvalidKdfConfiguration(_ /* message is ignored*/):
+            writeInt(&buf, Int32(3))
+        case .KeyIdMalformed(_ /* message is ignored*/):
+            writeInt(&buf, Int32(4))
+        case .MissingField(_ /* message is ignored*/):
+            writeInt(&buf, Int32(5))
+        case .Crypto(_ /* message is ignored*/):
+            writeInt(&buf, Int32(6))
+        case .WrongPassword(_ /* message is ignored*/):
+            writeInt(&buf, Int32(7))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMasterPasswordError_lift(_ buf: RustBuffer) throws -> MasterPasswordError {
+    return try FfiConverterTypeMasterPasswordError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMasterPasswordError_lower(_ value: MasterPasswordError) -> RustBuffer {
+    return FfiConverterTypeMasterPasswordError.lower(value)
+}
+
+
+/**
+ * Pin unlock can be configured to use one of two modes. Before-first-unlock and
+ * after-first-unlock. In AFU mode, the PIN is available only after unlocking once with the master
+ * password or another unlock method. In BFU mode, PIN unlock is available right after app start.
+ * For this, the PIN-encrypted vault key is stored on disk.
+ */
+
+public enum PinLockType: Equatable, Hashable, Codable {
+    
+    /**
+     * Pin unlock is available after app start
+     */
+    case beforeFirstUnlock
+    /**
+     * Pin unlock is available after unlocking with another method at least once during the app
+     * session
+     */
+    case afterFirstUnlock
 
 
 
+
+
+}
+
+#if compiler(>=6)
+extension PinLockType: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePinLockType: FfiConverterRustBuffer {
+    typealias SwiftType = PinLockType
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PinLockType {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .beforeFirstUnlock
+        
+        case 2: return .afterFirstUnlock
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PinLockType, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .beforeFirstUnlock:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .afterFirstUnlock:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePinLockType_lift(_ buf: RustBuffer) throws -> PinLockType {
+    return try FfiConverterTypePinLockType.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePinLockType_lower(_ value: PinLockType) -> RustBuffer {
+    return FfiConverterTypePinLockType.lower(value)
+}
+
+
+
+/**
+ * Current availability state for PIN-based unlock.
+ */
+
+public enum PinUnlockStatus: Equatable, Hashable, Codable {
+    
+    /**
+     * A PIN is configured and the PIN envelope is available for decryption, so PIN-based unlock
+     * can be attempted.
+     */
+    case available
+    /**
+     * A PIN is configured, but the vault must be unlocked using another method first.
+     */
+    case needsUnlock
+    /**
+     * No PIN is configured.
+     */
+    case notSet
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PinUnlockStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePinUnlockStatus: FfiConverterRustBuffer {
+    typealias SwiftType = PinUnlockStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PinUnlockStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .available
+        
+        case 2: return .needsUnlock
+        
+        case 3: return .notSet
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PinUnlockStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .available:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .needsUnlock:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .notSet:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePinUnlockStatus_lift(_ buf: RustBuffer) throws -> PinUnlockStatus {
+    return try FfiConverterTypePinUnlockStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePinUnlockStatus_lower(_ value: PinUnlockStatus) -> RustBuffer {
+    return FfiConverterTypePinUnlockStatus.lower(value)
+}
+
+
+
+/**
+ * Errors that can occur when re-initializing user cryptography state.
+ */
+public 
+enum ReinitUserCryptoError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
+    
+    
+    /**
+     * The SDK is not in an unlocked state, so it cannot re-initialize user crypto.
+     */
+    case NotUnlocked(message: String)
+    
+    /**
+     * The provided account cryptographic state is not V2. Re-initialization is only supported for
+     * upgrading to V2 encryption.
+     */
+    case InvalidAccountCryptographicState(message: String)
+    
+    /**
+     * The local migrations (pin key and local user data key) that runs as part of the V1->V2
+     * upgrade failed, likely due to missing state or keys that should be present during the
+     * upgrade process. Clients should deconstruct the SDK and initialize a fresh instance to
+     * recover.
+     */
+    case LocalMigrationFailed(message: String)
+    
+    /**
+     * The provided upgrade token was invalid, such as not decrypting properly with the active user
+     * key, or containing unexpected data.
+     */
+    case InvalidUpgradeToken(message: String)
+    
+    /**
+     * An error occurred during the cryptographic operations to re-initialize user crypto.
+     */
+    case CryptoInitialization(message: String)
+    
+    /**
+     * The SDK does not have a state bridge registered, which is required to perform V1->V2 local
+     * data migrations.
+     */
+    case StateBridgeNotRegistered(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension ReinitUserCryptoError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReinitUserCryptoError: FfiConverterRustBuffer {
+    typealias SwiftType = ReinitUserCryptoError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReinitUserCryptoError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .NotUnlocked(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .InvalidAccountCryptographicState(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .LocalMigrationFailed(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .InvalidUpgradeToken(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 5: return .CryptoInitialization(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 6: return .StateBridgeNotRegistered(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ReinitUserCryptoError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .NotUnlocked(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+        case .InvalidAccountCryptographicState(_ /* message is ignored*/):
+            writeInt(&buf, Int32(2))
+        case .LocalMigrationFailed(_ /* message is ignored*/):
+            writeInt(&buf, Int32(3))
+        case .InvalidUpgradeToken(_ /* message is ignored*/):
+            writeInt(&buf, Int32(4))
+        case .CryptoInitialization(_ /* message is ignored*/):
+            writeInt(&buf, Int32(5))
+        case .StateBridgeNotRegistered(_ /* message is ignored*/):
+            writeInt(&buf, Int32(6))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReinitUserCryptoError_lift(_ buf: RustBuffer) throws -> ReinitUserCryptoError {
+    return try FfiConverterTypeReinitUserCryptoError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReinitUserCryptoError_lower(_ value: ReinitUserCryptoError) -> RustBuffer {
+    return FfiConverterTypeReinitUserCryptoError.lower(value)
+}
+
+
+/**
+ * Errors that can occur during rotation of the account cryptographic state.
+ */
+public 
+enum RotateCryptographyStateError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
+    
+    
+    /**
+     * The key is missing from the key store
+     */
+    case KeyMissing(message: String)
+    
+    /**
+     * The provided data was invalid
+     */
+    case InvalidData(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension RotateCryptographyStateError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRotateCryptographyStateError: FfiConverterRustBuffer {
+    typealias SwiftType = RotateCryptographyStateError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RotateCryptographyStateError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .KeyMissing(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .InvalidData(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RotateCryptographyStateError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .KeyMissing(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+        case .InvalidData(_ /* message is ignored*/):
+            writeInt(&buf, Int32(2))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRotateCryptographyStateError_lift(_ buf: RustBuffer) throws -> RotateCryptographyStateError {
+    return try FfiConverterTypeRotateCryptographyStateError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRotateCryptographyStateError_lower(_ value: RotateCryptographyStateError) -> RustBuffer {
+    return FfiConverterTypeRotateCryptographyStateError.lower(value)
+}
+
+
+/**
+ * Signifies that the state is invalid from a cryptographic perspective, such as a required
+ * security value missing, or being invalid
+ */
+public 
+enum StatefulCryptoError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
+    
+    
+    /**
+     * The security state is not present, but required for this user. V2 users must always
+     * have a security state, V1 users cannot have a security state.
+     */
+    case MissingSecurityState(message: String)
+    
+    /**
+     * The function expected a user in a account cryptography version, but got a different one.
+     */
+    case WrongAccountCryptoVersion(message: String)
+    
+    case Crypto(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension StatefulCryptoError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStatefulCryptoError: FfiConverterRustBuffer {
+    typealias SwiftType = StatefulCryptoError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StatefulCryptoError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .MissingSecurityState(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .WrongAccountCryptoVersion(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .Crypto(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: StatefulCryptoError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .MissingSecurityState(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+        case .WrongAccountCryptoVersion(_ /* message is ignored*/):
+            writeInt(&buf, Int32(2))
+        case .Crypto(_ /* message is ignored*/):
+            writeInt(&buf, Int32(3))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStatefulCryptoError_lift(_ buf: RustBuffer) throws -> StatefulCryptoError {
+    return try FfiConverterTypeStatefulCryptoError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStatefulCryptoError_lower(_ value: StatefulCryptoError) -> RustBuffer {
+    return FfiConverterTypeStatefulCryptoError.lower(value)
+}
+
+
+public 
+enum TrustDeviceError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
+    
+    
+    case Crypto(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension TrustDeviceError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTrustDeviceError: FfiConverterRustBuffer {
+    typealias SwiftType = TrustDeviceError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TrustDeviceError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .Crypto(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TrustDeviceError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .Crypto(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrustDeviceError_lift(_ buf: RustBuffer) throws -> TrustDeviceError {
+    return try FfiConverterTypeTrustDeviceError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrustDeviceError_lower(_ value: TrustDeviceError) -> RustBuffer {
+    return FfiConverterTypeTrustDeviceError.lower(value)
+}
+
+
+/**
+ * Errors that can occur when computing a fingerprint.
+ */
+public 
+enum UserFingerprintError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
+    
+    
+    case Crypto(message: String)
+    
+    case MissingPrivateKey(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension UserFingerprintError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUserFingerprintError: FfiConverterRustBuffer {
+    typealias SwiftType = UserFingerprintError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UserFingerprintError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .Crypto(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .MissingPrivateKey(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: UserFingerprintError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .Crypto(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+        case .MissingPrivateKey(_ /* message is ignored*/):
+            writeInt(&buf, Int32(2))
+
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUserFingerprintError_lift(_ buf: RustBuffer) throws -> UserFingerprintError {
+    return try FfiConverterTypeUserFingerprintError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUserFingerprintError_lower(_ value: UserFingerprintError) -> RustBuffer {
+    return FfiConverterTypeUserFingerprintError.lower(value)
+}
+
+
+/**
+ * Any keys / cryptographic protection "downstream" from the account symmetric key (user key).
+ * Private keys are protected by the user key.
+ */
+
+public enum WrappedAccountCryptographicState: Equatable, Hashable, Codable {
+    
+    /**
+     * A V1 user has only a private key.
+     */
+    case v1(
+        /**
+         * The user's encryption private key, wrapped by the user key.
+         */privateKey: EncString
+    )
+    /**
+     * A V2 user has a private key, a signing key, a signed public key and a signed security state.
+     * The SignedPublicKey ensures that others can verify the public key is claimed by an identity
+     * they want to share data to. The signed security state protects against cryptographic
+     * downgrades.
+     */
+    case v2(
+        /**
+         * The user's encryption private key, wrapped by the user key.
+         */privateKey: EncString, 
+        /**
+         * The user's public-key for the private key, signed by the user's signing key.
+         * Note: This is optional for backwards compatibility. After a few releases, this will be
+         * made non-optional once all clients store the response on sync.
+         */signedPublicKey: SignedPublicKey?, 
+        /**
+         * The user's signing key, wrapped by the user key.
+         */signingKey: EncString, 
+        /**
+         * The user's signed security state.
+         */securityState: SignedSecurityState
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WrappedAccountCryptographicState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWrappedAccountCryptographicState: FfiConverterRustBuffer {
+    typealias SwiftType = WrappedAccountCryptographicState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WrappedAccountCryptographicState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .v1(privateKey: try FfiConverterTypeEncString.read(from: &buf)
+        )
+        
+        case 2: return .v2(privateKey: try FfiConverterTypeEncString.read(from: &buf), signedPublicKey: try FfiConverterOptionTypeSignedPublicKey.read(from: &buf), signingKey: try FfiConverterTypeEncString.read(from: &buf), securityState: try FfiConverterTypeSignedSecurityState.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: WrappedAccountCryptographicState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .v1(privateKey):
+            writeInt(&buf, Int32(1))
+            FfiConverterTypeEncString.write(privateKey, into: &buf)
+            
+        
+        case let .v2(privateKey,signedPublicKey,signingKey,securityState):
+            writeInt(&buf, Int32(2))
+            FfiConverterTypeEncString.write(privateKey, into: &buf)
+            FfiConverterOptionTypeSignedPublicKey.write(signedPublicKey, into: &buf)
+            FfiConverterTypeEncString.write(signingKey, into: &buf)
+            FfiConverterTypeSignedSecurityState.write(securityState, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWrappedAccountCryptographicState_lift(_ buf: RustBuffer) throws -> WrappedAccountCryptographicState {
+    return try FfiConverterTypeWrappedAccountCryptographicState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWrappedAccountCryptographicState_lower(_ value: WrappedAccountCryptographicState) -> RustBuffer {
+    return FfiConverterTypeWrappedAccountCryptographicState.lower(value)
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
+    typealias SwiftType = String?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeMasterPasswordUnlockData: FfiConverterRustBuffer {
+    typealias SwiftType = MasterPasswordUnlockData?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMasterPasswordUnlockData.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMasterPasswordUnlockData.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeV2UpgradeToken: FfiConverterRustBuffer {
+    typealias SwiftType = V2UpgradeToken?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeV2UpgradeToken.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeV2UpgradeToken.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeWebAuthnPrfUnlockData: FfiConverterRustBuffer {
+    typealias SwiftType = WebAuthnPrfUnlockData?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeWebAuthnPrfUnlockData.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeWebAuthnPrfUnlockData.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeTrustDeviceResponse: FfiConverterRustBuffer {
     typealias SwiftType = TrustDeviceResponse?
 
@@ -1937,23 +7855,316 @@ fileprivate struct FfiConverterOptionTypeTrustDeviceResponse: FfiConverterRustBu
     }
 }
 
-fileprivate struct FfiConverterDictionaryTypeUuidTypeAsymmetricEncString: FfiConverterRustBuffer {
-    public static func write(_ value: [Uuid: AsymmetricEncString], into buf: inout [UInt8]) {
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeWrappedAccountCryptographicState: FfiConverterRustBuffer {
+    typealias SwiftType = WrappedAccountCryptographicState?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeWrappedAccountCryptographicState.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeWrappedAccountCryptographicState.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeKdf: FfiConverterRustBuffer {
+    typealias SwiftType = Kdf?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeKdf.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeKdf.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeUserId: FfiConverterRustBuffer {
+    typealias SwiftType = UserId?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeUserId.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeUserId.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeV2EncryptedMigrationsGracePeriodStart: FfiConverterRustBuffer {
+    typealias SwiftType = V2EncryptedMigrationsGracePeriodStart?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeV2EncryptedMigrationsGracePeriodStart.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeV2EncryptedMigrationsGracePeriodStart.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeEncString: FfiConverterRustBuffer {
+    typealias SwiftType = EncString?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeEncString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeEncString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeKeyId: FfiConverterRustBuffer {
+    typealias SwiftType = KeyId?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeKeyId.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeKeyId.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypePasswordProtectedKeyEnvelope: FfiConverterRustBuffer {
+    typealias SwiftType = PasswordProtectedKeyEnvelope?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePasswordProtectedKeyEnvelope.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePasswordProtectedKeyEnvelope.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSignedPublicKey: FfiConverterRustBuffer {
+    typealias SwiftType = SignedPublicKey?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSignedPublicKey.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSignedPublicKey.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSymmetricCryptoKey: FfiConverterRustBuffer {
+    typealias SwiftType = SymmetricCryptoKey?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSymmetricCryptoKey.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSymmetricCryptoKey.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]
+
+    public static func write(_ value: [String], into buf: inout [UInt8]) {
         let len = Int32(value.count)
         writeInt(&buf, len)
-        for (key, value) in value {
-            FfiConverterTypeUuid.write(key, into: &buf)
-            FfiConverterTypeAsymmetricEncString.write(value, into: &buf)
+        for item in value {
+            FfiConverterString.write(item, into: &buf)
         }
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Uuid: AsymmetricEncString] {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
         let len: Int32 = try readInt(&buf)
-        var dict = [Uuid: AsymmetricEncString]()
+        var seq = [String]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeWebAuthnPrfUnlockOption: FfiConverterRustBuffer {
+    typealias SwiftType = [WebAuthnPrfUnlockOption]
+
+    public static func write(_ value: [WebAuthnPrfUnlockOption], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeWebAuthnPrfUnlockOption.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [WebAuthnPrfUnlockOption] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [WebAuthnPrfUnlockOption]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeWebAuthnPrfUnlockOption.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterDictionaryTypeOrganizationIdTypeUnsignedSharedKey: FfiConverterRustBuffer {
+    public static func write(_ value: [OrganizationId: UnsignedSharedKey], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for (key, value) in value {
+            FfiConverterTypeOrganizationId.write(key, into: &buf)
+            FfiConverterTypeUnsignedSharedKey.write(value, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [OrganizationId: UnsignedSharedKey] {
+        let len: Int32 = try readInt(&buf)
+        var dict = [OrganizationId: UnsignedSharedKey]()
         dict.reserveCapacity(Int(len))
         for _ in 0..<len {
-            let key = try FfiConverterTypeUuid.read(from: &buf)
-            let value = try FfiConverterTypeAsymmetricEncString.read(from: &buf)
+            let key = try FfiConverterTypeOrganizationId.read(from: &buf)
+            let value = try FfiConverterTypeUnsignedSharedKey.read(from: &buf)
             dict[key] = value
         }
         return dict
@@ -1961,21 +8172,11 @@ fileprivate struct FfiConverterDictionaryTypeUuidTypeAsymmetricEncString: FfiCon
 }
 
 
-
-
-
-
-
-
-
-
-
-
-/**
- * Typealias from the type name used in the UDL file to the builtin type.  This
- * is needed because the UDL type name is used in function/method signatures.
- */
 public typealias DateTime = Date
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeDateTime: FfiConverter {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DateTime {
         return try FfiConverterTimestamp.read(from: &buf)
@@ -1995,21 +8196,196 @@ public struct FfiConverterTypeDateTime: FfiConverter {
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeDateTime_lift(_ value: RustBuffer) throws -> DateTime {
     return try FfiConverterTypeDateTime.lift(value)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeDateTime_lower(_ value: DateTime) -> RustBuffer {
     return FfiConverterTypeDateTime.lower(value)
 }
 
 
 
-/**
- * Typealias from the type name used in the UDL file to the builtin type.  This
- * is needed because the UDL type name is used in function/method signatures.
- */
+
+
+public typealias NaiveDate = Date
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNaiveDate: FfiConverter {
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NaiveDate {
+        let builtinValue = try FfiConverterString.read(from: &buf)
+        return try NaiveDateFormatter.date(from: builtinValue)
+    }
+
+    public static func write(_ value: NaiveDate, into buf: inout [UInt8]) {
+        let builtinValue = NaiveDateFormatter.string(from: value)
+        return FfiConverterString.write(builtinValue, into: &buf)
+    }
+
+    public static func lift(_ value: RustBuffer) throws -> NaiveDate {
+        let builtinValue = try FfiConverterString.lift(value)
+        return try NaiveDateFormatter.date(from: builtinValue)
+    }
+
+    public static func lower(_ value: NaiveDate) -> RustBuffer {
+        let builtinValue = NaiveDateFormatter.string(from: value)
+        return FfiConverterString.lower(builtinValue)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNaiveDate_lift(_ value: RustBuffer) throws -> NaiveDate {
+    return try FfiConverterTypeNaiveDate.lift(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNaiveDate_lower(_ value: NaiveDate) -> RustBuffer {
+    return FfiConverterTypeNaiveDate.lower(value)
+}
+
+
+
+public typealias OrganizationId = Uuid
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOrganizationId: FfiConverter {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OrganizationId {
+        return try FfiConverterTypeUuid.read(from: &buf)
+    }
+
+    public static func write(_ value: OrganizationId, into buf: inout [UInt8]) {
+        return FfiConverterTypeUuid.write(value, into: &buf)
+    }
+
+    public static func lift(_ value: RustBuffer) throws -> OrganizationId {
+        return try FfiConverterTypeUuid_lift(value)
+    }
+
+    public static func lower(_ value: OrganizationId) -> RustBuffer {
+        return FfiConverterTypeUuid_lower(value)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOrganizationId_lift(_ value: RustBuffer) throws -> OrganizationId {
+    return try FfiConverterTypeOrganizationId.lift(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOrganizationId_lower(_ value: OrganizationId) -> RustBuffer {
+    return FfiConverterTypeOrganizationId.lower(value)
+}
+
+
+
+public typealias SignedSecurityState = String
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSignedSecurityState: FfiConverter {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SignedSecurityState {
+        return try FfiConverterString.read(from: &buf)
+    }
+
+    public static func write(_ value: SignedSecurityState, into buf: inout [UInt8]) {
+        return FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func lift(_ value: RustBuffer) throws -> SignedSecurityState {
+        return try FfiConverterString.lift(value)
+    }
+
+    public static func lower(_ value: SignedSecurityState) -> RustBuffer {
+        return FfiConverterString.lower(value)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignedSecurityState_lift(_ value: RustBuffer) throws -> SignedSecurityState {
+    return try FfiConverterTypeSignedSecurityState.lift(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignedSecurityState_lower(_ value: SignedSecurityState) -> RustBuffer {
+    return FfiConverterTypeSignedSecurityState.lower(value)
+}
+
+
+
+public typealias UserId = Uuid
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUserId: FfiConverter {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UserId {
+        return try FfiConverterTypeUuid.read(from: &buf)
+    }
+
+    public static func write(_ value: UserId, into buf: inout [UInt8]) {
+        return FfiConverterTypeUuid.write(value, into: &buf)
+    }
+
+    public static func lift(_ value: RustBuffer) throws -> UserId {
+        return try FfiConverterTypeUuid_lift(value)
+    }
+
+    public static func lower(_ value: UserId) -> RustBuffer {
+        return FfiConverterTypeUuid_lower(value)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUserId_lift(_ value: RustBuffer) throws -> UserId {
+    return try FfiConverterTypeUserId.lift(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUserId_lower(_ value: UserId) -> RustBuffer {
+    return FfiConverterTypeUserId.lower(value)
+}
+
+
+
 public typealias Uuid = String
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeUuid: FfiConverter {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Uuid {
         return try FfiConverterString.read(from: &buf)
@@ -2029,14 +8405,198 @@ public struct FfiConverterTypeUuid: FfiConverter {
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeUuid_lift(_ value: RustBuffer) throws -> Uuid {
     return try FfiConverterTypeUuid.lift(value)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeUuid_lower(_ value: Uuid) -> RustBuffer {
     return FfiConverterTypeUuid.lower(value)
 }
 
+
+
+public typealias V2EncryptedMigrationsGracePeriodStart = DateTime
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeV2EncryptedMigrationsGracePeriodStart: FfiConverter {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> V2EncryptedMigrationsGracePeriodStart {
+        return try FfiConverterTypeDateTime.read(from: &buf)
+    }
+
+    public static func write(_ value: V2EncryptedMigrationsGracePeriodStart, into buf: inout [UInt8]) {
+        return FfiConverterTypeDateTime.write(value, into: &buf)
+    }
+
+    public static func lift(_ value: RustBuffer) throws -> V2EncryptedMigrationsGracePeriodStart {
+        return try FfiConverterTypeDateTime_lift(value)
+    }
+
+    public static func lower(_ value: V2EncryptedMigrationsGracePeriodStart) -> RustBuffer {
+        return FfiConverterTypeDateTime_lower(value)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeV2EncryptedMigrationsGracePeriodStart_lift(_ value: RustBuffer) throws -> V2EncryptedMigrationsGracePeriodStart {
+    return try FfiConverterTypeV2EncryptedMigrationsGracePeriodStart.lift(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeV2EncryptedMigrationsGracePeriodStart_lower(_ value: V2EncryptedMigrationsGracePeriodStart) -> RustBuffer {
+    return FfiConverterTypeV2EncryptedMigrationsGracePeriodStart.lower(value)
+}
+
+private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
+private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
+
+fileprivate let uniffiContinuationHandleMap = UniffiHandleMap<UnsafeContinuation<Int8, Never>>()
+
+fileprivate func uniffiRustCallAsync<F, T>(
+    rustFutureFunc: () -> UInt64,
+    pollFunc: (UInt64, @escaping UniffiRustFutureContinuationCallback, UInt64) -> (),
+    completeFunc: (UInt64, UnsafeMutablePointer<RustCallStatus>) -> F,
+    freeFunc: (UInt64) -> (),
+    liftFunc: (F) throws -> T,
+    errorHandler: ((RustBuffer) throws -> Swift.Error)?
+) async throws -> T {
+    // Make sure to call the ensure init function since future creation doesn't have a
+    // RustCallStatus param, so doesn't use makeRustCall()
+    uniffiEnsureBitwardenCoreInitialized()
+    let rustFuture = rustFutureFunc()
+    defer {
+        freeFunc(rustFuture)
+    }
+    var pollResult: Int8;
+    repeat {
+        pollResult = await withUnsafeContinuation {
+            pollFunc(
+                rustFuture,
+                { handle, pollResult in
+                    uniffiFutureContinuationCallback(handle: handle, pollResult: pollResult)
+                },
+                uniffiContinuationHandleMap.insert(obj: $0)
+            )
+        }
+    } while pollResult != UNIFFI_RUST_FUTURE_POLL_READY
+
+    return try liftFunc(makeRustCall(
+        { completeFunc(rustFuture, $0) },
+        errorHandler: errorHandler
+    ))
+}
+
+// Callback handlers for an async calls.  These are invoked by Rust when the future is ready.  They
+// lift the return value or error and resume the suspended function.
+fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: Int8) {
+    if let continuation = try? uniffiContinuationHandleMap.remove(handle: handle) {
+        continuation.resume(returning: pollResult)
+    } else {
+        print("uniffiFutureContinuationCallback invalid handle")
+    }
+}
+private func uniffiTraitInterfaceCallAsync<T>(
+    makeCall: @escaping () async throws -> T,
+    handleSuccess: @escaping (T) -> (),
+    handleError: @escaping (Int8, RustBuffer) -> (),
+    droppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+) {
+    let task = Task {
+        // Note: it's important we call either `handleSuccess` or `handleError` exactly once.  Each
+        // call consumes an Arc reference, which means there should be no possibility of a double
+        // call.  The following code is structured so that will will never call both `handleSuccess`
+        // and `handleError`, even in the face of weird errors.
+        //
+        // On platforms that need extra machinery to make C-ABI calls, like JNA or ctypes, it's
+        // possible that we fail to make either call.  However, it doesn't seem like this is
+        // possible on Swift since swift can just make the C call directly.
+        var callResult: T
+        do {
+            callResult = try await makeCall()
+        } catch {
+            handleError(CALL_UNEXPECTED_ERROR, FfiConverterString.lower(String(describing: error)))
+            return
+        }
+        handleSuccess(callResult)
+    }
+    let handle = UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.insert(obj: task)
+    droppedCallback.pointee = UniffiForeignFutureDroppedCallbackStruct(
+        handle: handle,
+        free: uniffiForeignFutureDroppedCallback
+    )
+}
+
+private func uniffiTraitInterfaceCallAsyncWithError<T, E>(
+    makeCall: @escaping () async throws -> T,
+    handleSuccess: @escaping (T) -> (),
+    handleError: @escaping (Int8, RustBuffer) -> (),
+    lowerError: @escaping (E) -> RustBuffer,
+    droppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+) {
+    let task = Task {
+        // See the note in uniffiTraitInterfaceCallAsync for details on `handleSuccess` and
+        // `handleError`.
+        var callResult: T
+        do {
+            callResult = try await makeCall()
+        } catch let error as E {
+            handleError(CALL_ERROR, lowerError(error))
+            return
+        } catch {
+            handleError(CALL_UNEXPECTED_ERROR, FfiConverterString.lower(String(describing: error)))
+            return
+        }
+        handleSuccess(callResult)
+    }
+    let handle = UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.insert(obj: task)
+    droppedCallback.pointee = UniffiForeignFutureDroppedCallbackStruct(
+        handle: handle,
+        free: uniffiForeignFutureDroppedCallback
+    )
+}
+
+// Borrow the callback handle map implementation to store foreign future handles
+// TODO: consolidate the handle-map code (https://github.com/mozilla/uniffi-rs/pull/1823)
+fileprivate let UNIFFI_FOREIGN_FUTURE_HANDLE_MAP = UniffiHandleMap<UniffiForeignFutureTask>()
+
+// Protocol for tasks that handle foreign futures.
+//
+// Defining a protocol allows all tasks to be stored in the same handle map.  This can't be done
+// with the task object itself, since has generic parameters.
+fileprivate protocol UniffiForeignFutureTask {
+    func cancel()
+}
+
+extension Task: UniffiForeignFutureTask {}
+
+private func uniffiForeignFutureDroppedCallback(handle: UInt64) {
+    do {
+        let task = try UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.remove(handle: handle)
+        // Set the cancellation flag on the task.  If it's still running, the code can check the
+        // cancellation flag or call `Task.checkCancellation()`.  If the task has completed, this is
+        // a no-op.
+        task.cancel()
+    } catch {
+        print("uniffiForeignFutureDroppedCallback: handle missing from handlemap")
+    }
+}
+
+// For testing
+public func uniffiForeignFutureHandleCountBitwardenCore() -> Int {
+    UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.count
+}
 
 private enum InitializationResult {
     case ok
@@ -2045,19 +8605,130 @@ private enum InitializationResult {
 }
 // Use a global variable to perform the versioning checks. Swift ensures that
 // the code inside is only computed once.
-private var initializationResult: InitializationResult = {
+private let initializationResult: InitializationResult = {
     // Get the bindings contract version from our ComponentInterface
-    let bindings_contract_version = 26
+    let bindings_contract_version = 30
     // Get the scaffolding contract version by calling the into the dylib
     let scaffolding_contract_version = ffi_bitwarden_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_bitwarden_core_checksum_method_clientmanagedtokens_get_access_token() != 773) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeclient_register_bridge_impl() != 12117) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_set_user_key() != 23197) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_get_user_key() != 19508) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_clear_user_key() != 39934) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_set_user_key_id() != 10192) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_get_user_key_id() != 2994) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_clear_user_key_id() != 34811) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_set_persistent_pin_envelope() != 57128) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_get_persistent_pin_envelope() != 49175) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_clear_persistent_pin_envelope() != 6560) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_set_ephemeral_pin_envelope() != 27856) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_get_ephemeral_pin_envelope() != 39615) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_clear_ephemeral_pin_envelope() != 17498) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_set_encrypted_pin() != 17509) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_get_encrypted_pin() != 19563) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_clear_encrypted_pin() != 10055) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_set_v2_upgrade_token() != 9446) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_get_v2_upgrade_token() != 53579) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_clear_v2_upgrade_token() != 28561) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_set_account_cryptographic_state() != 60012) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_get_account_cryptographic_state() != 47859) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_clear_account_cryptographic_state() != 8738) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_set_masterpassword_unlock_data() != 28882) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_get_masterpassword_unlock_data() != 61247) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_clear_masterpassword_unlock_data() != 32522) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_set_webauthn_prf_unlock_data() != 33517) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_get_webauthn_prf_unlock_data() != 45954) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_clear_webauthn_prf_unlock_data() != 27969) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_set_kdf_config() != 13425) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_get_kdf_config() != 32905) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_clear_kdf_config() != 3217) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_set_v2_encrypted_migrations_grace_period_start() != 2362) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_get_v2_encrypted_migrations_grace_period_start() != 35678) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_bitwarden_core_checksum_method_statebridgeforeignimpl_clear_v2_encrypted_migrations_grace_period_start() != 23521) {
+        return InitializationResult.apiChecksumMismatch
+    }
 
+    uniffiCallbackInitClientManagedTokens()
+    uniffiCallbackInitStateBridgeForeignImpl()
+    uniffiEnsureBitwardenCryptoInitialized()
+    uniffiEnsureBitwardenEncodingInitialized()
     return InitializationResult.ok
 }()
 
-private func uniffiEnsureInitialized() {
+// Make the ensure init function public so that other modules which have external type references to
+// our types can call it.
+public func uniffiEnsureBitwardenCoreInitialized() {
     switch initializationResult {
     case .ok:
         break

@@ -39,6 +39,52 @@ fileprivate extension ForeignBytes {
     init(bufferPointer: UnsafeBufferPointer<UInt8>) {
         self.init(len: Int32(bufferPointer.count), data: bufferPointer.baseAddress)
     }
+
+    init(rawBufferPointer: UnsafeRawBufferPointer) {
+        self.init(
+            len: Int32(rawBufferPointer.count),
+            data: rawBufferPointer.baseAddress?.assumingMemoryBound(to: UInt8.self)
+        )
+    }
+}
+
+// Converter for `&[u8]` / `[ByRef] bytes` arguments.
+//
+// Conforms to `FfiConverter` so the compiler enforces the full converter
+// method set. Only the scope-bound `lower(_:_body:)` overload is sound —
+// zero-copy byte buffers only flow foreign -> Rust, and only in argument
+// position. The four protocol-witness methods (`lift`, `lower`, `read`,
+// `write`) `fatalError` at runtime if anyone reaches them.
+//
+// The scope-bound `lower` takes a closure because the `ForeignBytes`
+// pointer is only guaranteed valid for the duration of
+// `Data.withUnsafeBytes`. Callers must run the full FFI call inside
+// the closure body.
+fileprivate enum FfiConverterByRefBytes: FfiConverter {
+    typealias SwiftType = Data
+    typealias FfiType = ForeignBytes
+
+    static func lower<R>(_ value: Data, _ body: (ForeignBytes) throws -> R) rethrows -> R {
+        return try value.withUnsafeBytes { rawBuf in
+            try body(ForeignBytes(rawBufferPointer: rawBuf))
+        }
+    }
+
+    static func lower(_ value: Data) -> ForeignBytes {
+        fatalError("ByRef bytes cannot use the plain lower: returning ForeignBytes escapes the Data.withUnsafeBytes scope. Use the scope-bound lower(_:_body:) overload instead.")
+    }
+
+    static func lift(_ value: ForeignBytes) throws -> Data {
+        fatalError("ByRef bytes cannot be lifted: zero-copy &[u8] only flows foreign->Rust")
+    }
+
+    static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
+        fatalError("ByRef bytes cannot be read from a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+    }
+
+    static func write(_ value: Data, into buf: inout [UInt8]) {
+        fatalError("ByRef bytes cannot be written to a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+    }
 }
 
 // For every type used in the interface, we provide helper methods for conveniently
@@ -170,10 +216,16 @@ fileprivate protocol FfiConverter {
 fileprivate protocol FfiConverterPrimitive: FfiConverter where FfiType == SwiftType { }
 
 extension FfiConverterPrimitive {
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
     public static func lift(_ value: FfiType) throws -> SwiftType {
         return value
     }
 
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
     public static func lower(_ value: SwiftType) -> FfiType {
         return value
     }
@@ -184,6 +236,9 @@ extension FfiConverterPrimitive {
 fileprivate protocol FfiConverterRustBuffer: FfiConverter where FfiType == RustBuffer {}
 
 extension FfiConverterRustBuffer {
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
     public static func lift(_ buf: RustBuffer) throws -> SwiftType {
         var reader = createReader(data: Data(rustBuffer: buf))
         let value = try read(from: &reader)
@@ -194,6 +249,9 @@ extension FfiConverterRustBuffer {
         return value
     }
 
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
     public static func lower(_ value: SwiftType) -> RustBuffer {
           var writer = createWriter()
           write(value, into: &writer)
@@ -269,7 +327,7 @@ private func makeRustCall<T, E: Swift.Error>(
     _ callback: (UnsafeMutablePointer<RustCallStatus>) -> T,
     errorHandler: ((RustBuffer) throws -> E)?
 ) throws -> T {
-    uniffiEnsureInitialized()
+    uniffiEnsureBitwardenCryptoInitialized()
     var callStatus = RustCallStatus.init()
     let returnedVal = callback(&callStatus)
     try uniffiCheckCallStatus(callStatus: callStatus, errorHandler: errorHandler)
@@ -340,18 +398,29 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
         callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
     }
 }
-fileprivate class UniffiHandleMap<T> {
-    private var map: [UInt64: T] = [:]
+// Initial value and increment amount for handles. 
+// These ensure that SWIFT handles always have the lowest bit set
+fileprivate let UNIFFI_HANDLEMAP_INITIAL: UInt64 = 1
+fileprivate let UNIFFI_HANDLEMAP_DELTA: UInt64 = 2
+
+fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
+    // All mutation happens with this lock held, which is why we implement @unchecked Sendable.
     private let lock = NSLock()
-    private var currentHandle: UInt64 = 1
+    private var map: [UInt64: T] = [:]
+    private var currentHandle: UInt64 = UNIFFI_HANDLEMAP_INITIAL
 
     func insert(obj: T) -> UInt64 {
         lock.withLock {
-            let handle = currentHandle
-            currentHandle += 1
-            map[handle] = obj
-            return handle
+            return doInsert(obj)
         }
+    }
+
+    // Low-level insert function, this assumes `lock` is held.
+    private func doInsert(_ obj: T) -> UInt64 {
+        let handle = currentHandle
+        currentHandle += UNIFFI_HANDLEMAP_DELTA
+        map[handle] = obj
+        return handle
     }
 
      func get(handle: UInt64) throws -> T {
@@ -360,6 +429,15 @@ fileprivate class UniffiHandleMap<T> {
                 throw UniffiInternalError.unexpectedStaleHandle
             }
             return obj
+        }
+    }
+
+     func clone(handle: UInt64) throws -> UInt64 {
+        try lock.withLock {
+            guard let obj = map[handle] else {
+                throw UniffiInternalError.unexpectedStaleHandle
+            }
+            return doInsert(obj)
         }
     }
 
@@ -384,6 +462,9 @@ fileprivate class UniffiHandleMap<T> {
 // Public interface members begin here.
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
     typealias FfiType = UInt32
     typealias SwiftType = UInt32
@@ -397,6 +478,9 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterString: FfiConverter {
     typealias SwiftType = String
     typealias FfiType = RustBuffer
@@ -409,7 +493,11 @@ fileprivate struct FfiConverterString: FfiConverter {
             return String()
         }
         let bytes = UnsafeBufferPointer<UInt8>(start: value.data!, count: Int(value.len))
-        return String(bytes: bytes, encoding: String.Encoding.utf8)!
+        // Use Swift's native UTF-8 decoder; `String(bytes:encoding:.utf8)` goes
+        // through Foundation's NSString and silently strips a leading U+FEFF BOM.
+        // Invalid UTF-8 substitutes U+FFFD instead of trapping (unreachable
+        // given Rust's `String` invariant).
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     public static func lower(_ value: String) -> RustBuffer {
@@ -425,7 +513,8 @@ fileprivate struct FfiConverterString: FfiConverter {
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> String {
         let len: Int32 = try readInt(&buf)
-        return String(bytes: try readBytes(&buf, count: Int(len)), encoding: String.Encoding.utf8)!
+        // See `lift` above for why we avoid Foundation's NSString-backed decoder here.
+        return String(decoding: try readBytes(&buf, count: Int(len)), as: UTF8.self)
     }
 
     public static func write(_ value: String, into buf: inout [UInt8]) {
@@ -435,17 +524,123 @@ fileprivate struct FfiConverterString: FfiConverter {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterData: FfiConverterRustBuffer {
+    typealias SwiftType = Data
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
+        let len: Int32 = try readInt(&buf)
+        return Data(try readBytes(&buf, count: Int(len)))
+    }
+
+    public static func write(_ value: Data, into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        writeBytes(&buf, value)
+    }
+}
+
+
+/**
+ * A set of keys where a given `DownstreamKey` is protected by an encrypted public/private
+ * key-pair. The `DownstreamKey` is used to encrypt/decrypt data, while the public/private key-pair
+ * is used to rotate the `DownstreamKey`.
+ *
+ * The `PrivateKey` is protected by an `UpstreamKey`, such as a `DeviceKey`, or `PrfKey`,
+ * and the `PublicKey` is protected by the `DownstreamKey`. This setup allows:
+ *
+ * - Access to `DownstreamKey` by knowing the `UpstreamKey`
+ * - Rotation to a `NewDownstreamKey` by knowing the current `DownstreamKey`, without needing
+ * access to the `UpstreamKey`
+ */
+public struct RotateableKeySet: Equatable, Hashable, Codable {
+    /**
+     * `DownstreamKey` protected by encapsulation key
+     */
+    public let encapsulatedDownstreamKey: UnsignedSharedKey
+    /**
+     * Encapsulation key protected by `DownstreamKey`
+     */
+    public let encryptedEncapsulationKey: EncString
+    /**
+     * Decapsulation key protected by `UpstreamKey`
+     */
+    public let encryptedDecapsulationKey: EncString
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * `DownstreamKey` protected by encapsulation key
+         */encapsulatedDownstreamKey: UnsignedSharedKey, 
+        /**
+         * Encapsulation key protected by `DownstreamKey`
+         */encryptedEncapsulationKey: EncString, 
+        /**
+         * Decapsulation key protected by `UpstreamKey`
+         */encryptedDecapsulationKey: EncString) {
+        self.encapsulatedDownstreamKey = encapsulatedDownstreamKey
+        self.encryptedEncapsulationKey = encryptedEncapsulationKey
+        self.encryptedDecapsulationKey = encryptedDecapsulationKey
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension RotateableKeySet: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRotateableKeySet: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RotateableKeySet {
+        return
+            try RotateableKeySet(
+                encapsulatedDownstreamKey: FfiConverterTypeUnsignedSharedKey.read(from: &buf), 
+                encryptedEncapsulationKey: FfiConverterTypeEncString.read(from: &buf), 
+                encryptedDecapsulationKey: FfiConverterTypeEncString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RotateableKeySet, into buf: inout [UInt8]) {
+        FfiConverterTypeUnsignedSharedKey.write(value.encapsulatedDownstreamKey, into: &buf)
+        FfiConverterTypeEncString.write(value.encryptedEncapsulationKey, into: &buf)
+        FfiConverterTypeEncString.write(value.encryptedDecapsulationKey, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRotateableKeySet_lift(_ buf: RustBuffer) throws -> RotateableKeySet {
+    return try FfiConverterTypeRotateableKeySet.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRotateableKeySet_lower(_ value: RotateableKeySet) -> RustBuffer {
+    return FfiConverterTypeRotateableKeySet.lower(value)
+}
+
 
 /**
  * RSA Key Pair
  *
  * Consists of a public key and an encrypted private key.
  */
-public struct RsaKeyPair {
+public struct RsaKeyPair: Equatable, Hashable, Codable {
     /**
      * Base64 encoded DER representation of the public key
      */
-    public let `public`: String
+    public let `public`: B64
     /**
      * Encrypted PKCS8 private key
      */
@@ -456,69 +651,66 @@ public struct RsaKeyPair {
     public init(
         /**
          * Base64 encoded DER representation of the public key
-         */`public`: String, 
+         */`public`: B64, 
         /**
          * Encrypted PKCS8 private key
          */`private`: EncString) {
         self.`public` = `public`
         self.`private` = `private`
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension RsaKeyPair: Sendable {}
+#endif
 
-
-extension RsaKeyPair: Equatable, Hashable {
-    public static func ==(lhs: RsaKeyPair, rhs: RsaKeyPair) -> Bool {
-        if lhs.`public` != rhs.`public` {
-            return false
-        }
-        if lhs.`private` != rhs.`private` {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(`public`)
-        hasher.combine(`private`)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeRsaKeyPair: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RsaKeyPair {
         return
             try RsaKeyPair(
-                public: FfiConverterString.read(from: &buf), 
+                public: FfiConverterTypeB64.read(from: &buf), 
                 private: FfiConverterTypeEncString.read(from: &buf)
         )
     }
 
     public static func write(_ value: RsaKeyPair, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.`public`, into: &buf)
+        FfiConverterTypeB64.write(value.`public`, into: &buf)
         FfiConverterTypeEncString.write(value.`private`, into: &buf)
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeRsaKeyPair_lift(_ buf: RustBuffer) throws -> RsaKeyPair {
     return try FfiConverterTypeRsaKeyPair.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeRsaKeyPair_lower(_ value: RsaKeyPair) -> RustBuffer {
     return FfiConverterTypeRsaKeyPair.lower(value)
 }
 
 
-public struct TrustDeviceResponse {
+public struct TrustDeviceResponse: Equatable, Hashable, Codable {
     /**
      * Base64 encoded device key
      */
-    public let deviceKey: String
+    public let deviceKey: B64
     /**
      * UserKey encrypted with DevicePublicKey
      */
-    public let protectedUserKey: AsymmetricEncString
+    public let protectedUserKey: UnsignedSharedKey
     /**
      * DevicePrivateKey encrypted with [DeviceKey]
      */
@@ -533,10 +725,10 @@ public struct TrustDeviceResponse {
     public init(
         /**
          * Base64 encoded device key
-         */deviceKey: String, 
+         */deviceKey: B64, 
         /**
          * UserKey encrypted with DevicePublicKey
-         */protectedUserKey: AsymmetricEncString, 
+         */protectedUserKey: UnsignedSharedKey, 
         /**
          * DevicePrivateKey encrypted with [DeviceKey]
          */protectedDevicePrivateKey: EncString, 
@@ -548,74 +740,356 @@ public struct TrustDeviceResponse {
         self.protectedDevicePrivateKey = protectedDevicePrivateKey
         self.protectedDevicePublicKey = protectedDevicePublicKey
     }
+
+    
+
+    
 }
 
+#if compiler(>=6)
+extension TrustDeviceResponse: Sendable {}
+#endif
 
-
-extension TrustDeviceResponse: Equatable, Hashable {
-    public static func ==(lhs: TrustDeviceResponse, rhs: TrustDeviceResponse) -> Bool {
-        if lhs.deviceKey != rhs.deviceKey {
-            return false
-        }
-        if lhs.protectedUserKey != rhs.protectedUserKey {
-            return false
-        }
-        if lhs.protectedDevicePrivateKey != rhs.protectedDevicePrivateKey {
-            return false
-        }
-        if lhs.protectedDevicePublicKey != rhs.protectedDevicePublicKey {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(deviceKey)
-        hasher.combine(protectedUserKey)
-        hasher.combine(protectedDevicePrivateKey)
-        hasher.combine(protectedDevicePublicKey)
-    }
-}
-
-
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeTrustDeviceResponse: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TrustDeviceResponse {
         return
             try TrustDeviceResponse(
-                deviceKey: FfiConverterString.read(from: &buf), 
-                protectedUserKey: FfiConverterTypeAsymmetricEncString.read(from: &buf), 
+                deviceKey: FfiConverterTypeB64.read(from: &buf), 
+                protectedUserKey: FfiConverterTypeUnsignedSharedKey.read(from: &buf), 
                 protectedDevicePrivateKey: FfiConverterTypeEncString.read(from: &buf), 
                 protectedDevicePublicKey: FfiConverterTypeEncString.read(from: &buf)
         )
     }
 
     public static func write(_ value: TrustDeviceResponse, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.deviceKey, into: &buf)
-        FfiConverterTypeAsymmetricEncString.write(value.protectedUserKey, into: &buf)
+        FfiConverterTypeB64.write(value.deviceKey, into: &buf)
+        FfiConverterTypeUnsignedSharedKey.write(value.protectedUserKey, into: &buf)
         FfiConverterTypeEncString.write(value.protectedDevicePrivateKey, into: &buf)
         FfiConverterTypeEncString.write(value.protectedDevicePublicKey, into: &buf)
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeTrustDeviceResponse_lift(_ buf: RustBuffer) throws -> TrustDeviceResponse {
     return try FfiConverterTypeTrustDeviceResponse.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeTrustDeviceResponse_lower(_ value: TrustDeviceResponse) -> RustBuffer {
     return FfiConverterTypeTrustDeviceResponse.lower(value)
 }
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
-public enum HashPurpose {
+public 
+enum CryptoError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+
     
-    case serverAuthorization
-    case localAuthorization
+    
+    case Decrypt(message: String)
+    
+    case InvalidKey(message: String)
+    
+    case KeyDecrypt(message: String)
+    
+    case InvalidKeyLen(message: String)
+    
+    case InvalidUtf8String(message: String)
+    
+    case MissingKey(message: String)
+    
+    case MissingField(message: String)
+    
+    case MissingKeyId(message: String)
+    
+    case KeyOperationNotSupported(message: String)
+    
+    case EncryptRestrictedView(message: String)
+    
+    case RestrictedCipherRequiresOrganization(message: String)
+    
+    case ReadOnlyKeyStore(message: String)
+    
+    case InvalidKeyStoreOperation(message: String)
+    
+    case InsufficientKdfParameters(message: String)
+    
+    case EncString(message: String)
+    
+    case UnparseableEncString(message: String)
+    
+    case Rsa(message: String)
+    
+    case Fingerprint(message: String)
+    
+    case Argon(message: String)
+    
+    case ZeroNumber(message: String)
+    
+    case OperationNotSupported(message: String)
+    
+    case WrongKeyType(message: String)
+    
+    case WrongCoseKeyId(message: String)
+    
+    case InvalidNonceLength(message: String)
+    
+    case InvalidPadding(message: String)
+    
+    case Signature(message: String)
+    
+    case Encoding(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension CryptoError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCryptoError: FfiConverterRustBuffer {
+    typealias SwiftType = CryptoError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CryptoError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .Decrypt(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .InvalidKey(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .KeyDecrypt(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .InvalidKeyLen(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 5: return .InvalidUtf8String(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 6: return .MissingKey(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 7: return .MissingField(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 8: return .MissingKeyId(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 9: return .KeyOperationNotSupported(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 10: return .EncryptRestrictedView(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 11: return .RestrictedCipherRequiresOrganization(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 12: return .ReadOnlyKeyStore(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 13: return .InvalidKeyStoreOperation(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 14: return .InsufficientKdfParameters(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 15: return .EncString(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 16: return .UnparseableEncString(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 17: return .Rsa(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 18: return .Fingerprint(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 19: return .Argon(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 20: return .ZeroNumber(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 21: return .OperationNotSupported(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 22: return .WrongKeyType(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 23: return .WrongCoseKeyId(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 24: return .InvalidNonceLength(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 25: return .InvalidPadding(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 26: return .Signature(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 27: return .Encoding(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CryptoError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .Decrypt(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+        case .InvalidKey(_ /* message is ignored*/):
+            writeInt(&buf, Int32(2))
+        case .KeyDecrypt(_ /* message is ignored*/):
+            writeInt(&buf, Int32(3))
+        case .InvalidKeyLen(_ /* message is ignored*/):
+            writeInt(&buf, Int32(4))
+        case .InvalidUtf8String(_ /* message is ignored*/):
+            writeInt(&buf, Int32(5))
+        case .MissingKey(_ /* message is ignored*/):
+            writeInt(&buf, Int32(6))
+        case .MissingField(_ /* message is ignored*/):
+            writeInt(&buf, Int32(7))
+        case .MissingKeyId(_ /* message is ignored*/):
+            writeInt(&buf, Int32(8))
+        case .KeyOperationNotSupported(_ /* message is ignored*/):
+            writeInt(&buf, Int32(9))
+        case .EncryptRestrictedView(_ /* message is ignored*/):
+            writeInt(&buf, Int32(10))
+        case .RestrictedCipherRequiresOrganization(_ /* message is ignored*/):
+            writeInt(&buf, Int32(11))
+        case .ReadOnlyKeyStore(_ /* message is ignored*/):
+            writeInt(&buf, Int32(12))
+        case .InvalidKeyStoreOperation(_ /* message is ignored*/):
+            writeInt(&buf, Int32(13))
+        case .InsufficientKdfParameters(_ /* message is ignored*/):
+            writeInt(&buf, Int32(14))
+        case .EncString(_ /* message is ignored*/):
+            writeInt(&buf, Int32(15))
+        case .UnparseableEncString(_ /* message is ignored*/):
+            writeInt(&buf, Int32(16))
+        case .Rsa(_ /* message is ignored*/):
+            writeInt(&buf, Int32(17))
+        case .Fingerprint(_ /* message is ignored*/):
+            writeInt(&buf, Int32(18))
+        case .Argon(_ /* message is ignored*/):
+            writeInt(&buf, Int32(19))
+        case .ZeroNumber(_ /* message is ignored*/):
+            writeInt(&buf, Int32(20))
+        case .OperationNotSupported(_ /* message is ignored*/):
+            writeInt(&buf, Int32(21))
+        case .WrongKeyType(_ /* message is ignored*/):
+            writeInt(&buf, Int32(22))
+        case .WrongCoseKeyId(_ /* message is ignored*/):
+            writeInt(&buf, Int32(23))
+        case .InvalidNonceLength(_ /* message is ignored*/):
+            writeInt(&buf, Int32(24))
+        case .InvalidPadding(_ /* message is ignored*/):
+            writeInt(&buf, Int32(25))
+        case .Signature(_ /* message is ignored*/):
+            writeInt(&buf, Int32(26))
+        case .Encoding(_ /* message is ignored*/):
+            writeInt(&buf, Int32(27))
+
+        
+        }
+    }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCryptoError_lift(_ buf: RustBuffer) throws -> CryptoError {
+    return try FfiConverterTypeCryptoError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCryptoError_lower(_ value: CryptoError) -> RustBuffer {
+    return FfiConverterTypeCryptoError.lower(value)
+}
+
+
+
+public enum HashPurpose: Equatable, Hashable, Codable {
+    
+    case serverAuthorization
+    case localAuthorization
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension HashPurpose: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeHashPurpose: FfiConverterRustBuffer {
     typealias SwiftType = HashPurpose
 
@@ -647,22 +1121,22 @@ public struct FfiConverterTypeHashPurpose: FfiConverterRustBuffer {
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeHashPurpose_lift(_ buf: RustBuffer) throws -> HashPurpose {
     return try FfiConverterTypeHashPurpose.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeHashPurpose_lower(_ value: HashPurpose) -> RustBuffer {
     return FfiConverterTypeHashPurpose.lower(value)
 }
 
 
 
-extension HashPurpose: Equatable, Hashable {}
-
-
-
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
  * Key Derivation Function for Bitwarden Account
  *
@@ -670,15 +1144,26 @@ extension HashPurpose: Equatable, Hashable {}
  * Enum represents all the possible KDFs.
  */
 
-public enum Kdf {
+public enum Kdf: Equatable, Hashable, Codable {
     
     case pbkdf2(iterations: NonZeroU32
     )
     case argon2id(iterations: NonZeroU32, memory: NonZeroU32, parallelism: NonZeroU32
     )
+
+
+
+
+
 }
 
+#if compiler(>=6)
+extension Kdf: Sendable {}
+#endif
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeKdf: FfiConverterRustBuffer {
     typealias SwiftType = Kdf
 
@@ -716,60 +1201,145 @@ public struct FfiConverterTypeKdf: FfiConverterRustBuffer {
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeKdf_lift(_ buf: RustBuffer) throws -> Kdf {
     return try FfiConverterTypeKdf.lift(buf)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeKdf_lower(_ value: Kdf) -> RustBuffer {
     return FfiConverterTypeKdf.lower(value)
 }
 
 
 
-extension Kdf: Equatable, Hashable {}
-
-
-
-
 /**
- * Typealias from the type name used in the UDL file to the builtin type.  This
- * is needed because the UDL type name is used in function/method signatures.
+ * The type of key / signature scheme used for signing and verifying.
  */
-public typealias AsymmetricEncString = String
-public struct FfiConverterTypeAsymmetricEncString: FfiConverter {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AsymmetricEncString {
+
+public enum SignatureAlgorithm: Equatable, Hashable, Codable {
+    
+    /**
+     * Ed25519 is the modern, secure recommended option for digital signatures on eliptic curves,
+     * safe under the assumption that an attacker does not have access to a large-scale quantum
+     * computer.
+     */
+    case ed25519
+    /**
+     * ML-DSA-44 is the NIST post-quantum digital signature standard (FIPS 204), security category
+     * 2.
+     */
+    case mlDsa44
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SignatureAlgorithm: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSignatureAlgorithm: FfiConverterRustBuffer {
+    typealias SwiftType = SignatureAlgorithm
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SignatureAlgorithm {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .ed25519
+        
+        case 2: return .mlDsa44
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SignatureAlgorithm, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .ed25519:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .mlDsa44:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignatureAlgorithm_lift(_ buf: RustBuffer) throws -> SignatureAlgorithm {
+    return try FfiConverterTypeSignatureAlgorithm.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignatureAlgorithm_lower(_ value: SignatureAlgorithm) -> RustBuffer {
+    return FfiConverterTypeSignatureAlgorithm.lower(value)
+}
+
+
+
+public typealias DataEnvelope = String
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDataEnvelope: FfiConverter {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DataEnvelope {
         return try FfiConverterString.read(from: &buf)
     }
 
-    public static func write(_ value: AsymmetricEncString, into buf: inout [UInt8]) {
+    public static func write(_ value: DataEnvelope, into buf: inout [UInt8]) {
         return FfiConverterString.write(value, into: &buf)
     }
 
-    public static func lift(_ value: RustBuffer) throws -> AsymmetricEncString {
+    public static func lift(_ value: RustBuffer) throws -> DataEnvelope {
         return try FfiConverterString.lift(value)
     }
 
-    public static func lower(_ value: AsymmetricEncString) -> RustBuffer {
+    public static func lower(_ value: DataEnvelope) -> RustBuffer {
         return FfiConverterString.lower(value)
     }
 }
 
 
-public func FfiConverterTypeAsymmetricEncString_lift(_ value: RustBuffer) throws -> AsymmetricEncString {
-    return try FfiConverterTypeAsymmetricEncString.lift(value)
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDataEnvelope_lift(_ value: RustBuffer) throws -> DataEnvelope {
+    return try FfiConverterTypeDataEnvelope.lift(value)
 }
 
-public func FfiConverterTypeAsymmetricEncString_lower(_ value: AsymmetricEncString) -> RustBuffer {
-    return FfiConverterTypeAsymmetricEncString.lower(value)
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDataEnvelope_lower(_ value: DataEnvelope) -> RustBuffer {
+    return FfiConverterTypeDataEnvelope.lower(value)
 }
 
 
 
-/**
- * Typealias from the type name used in the UDL file to the builtin type.  This
- * is needed because the UDL type name is used in function/method signatures.
- */
 public typealias EncString = String
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeEncString: FfiConverter {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EncString {
         return try FfiConverterString.read(from: &buf)
@@ -789,21 +1359,107 @@ public struct FfiConverterTypeEncString: FfiConverter {
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeEncString_lift(_ value: RustBuffer) throws -> EncString {
     return try FfiConverterTypeEncString.lift(value)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeEncString_lower(_ value: EncString) -> RustBuffer {
     return FfiConverterTypeEncString.lower(value)
 }
 
 
 
-/**
- * Typealias from the type name used in the UDL file to the builtin type.  This
- * is needed because the UDL type name is used in function/method signatures.
- */
+public typealias HighEntropySecret = Data
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHighEntropySecret: FfiConverter {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HighEntropySecret {
+        return try FfiConverterData.read(from: &buf)
+    }
+
+    public static func write(_ value: HighEntropySecret, into buf: inout [UInt8]) {
+        return FfiConverterData.write(value, into: &buf)
+    }
+
+    public static func lift(_ value: RustBuffer) throws -> HighEntropySecret {
+        return try FfiConverterData.lift(value)
+    }
+
+    public static func lower(_ value: HighEntropySecret) -> RustBuffer {
+        return FfiConverterData.lower(value)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHighEntropySecret_lift(_ value: RustBuffer) throws -> HighEntropySecret {
+    return try FfiConverterTypeHighEntropySecret.lift(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHighEntropySecret_lower(_ value: HighEntropySecret) -> RustBuffer {
+    return FfiConverterTypeHighEntropySecret.lower(value)
+}
+
+
+
+public typealias KeyId = String
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeKeyId: FfiConverter {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KeyId {
+        return try FfiConverterString.read(from: &buf)
+    }
+
+    public static func write(_ value: KeyId, into buf: inout [UInt8]) {
+        return FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func lift(_ value: RustBuffer) throws -> KeyId {
+        return try FfiConverterString.lift(value)
+    }
+
+    public static func lower(_ value: KeyId) -> RustBuffer {
+        return FfiConverterString.lower(value)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeKeyId_lift(_ value: RustBuffer) throws -> KeyId {
+    return try FfiConverterTypeKeyId.lift(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeKeyId_lower(_ value: KeyId) -> RustBuffer {
+    return FfiConverterTypeKeyId.lower(value)
+}
+
+
+
 public typealias NonZeroU32 = UInt32
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public struct FfiConverterTypeNonZeroU32: FfiConverter {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NonZeroU32 {
         return try FfiConverterUInt32.read(from: &buf)
@@ -823,12 +1479,258 @@ public struct FfiConverterTypeNonZeroU32: FfiConverter {
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeNonZeroU32_lift(_ value: UInt32) throws -> NonZeroU32 {
     return try FfiConverterTypeNonZeroU32.lift(value)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 public func FfiConverterTypeNonZeroU32_lower(_ value: NonZeroU32) -> UInt32 {
     return FfiConverterTypeNonZeroU32.lower(value)
+}
+
+
+
+public typealias PasswordProtectedKeyEnvelope = String
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePasswordProtectedKeyEnvelope: FfiConverter {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PasswordProtectedKeyEnvelope {
+        return try FfiConverterString.read(from: &buf)
+    }
+
+    public static func write(_ value: PasswordProtectedKeyEnvelope, into buf: inout [UInt8]) {
+        return FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func lift(_ value: RustBuffer) throws -> PasswordProtectedKeyEnvelope {
+        return try FfiConverterString.lift(value)
+    }
+
+    public static func lower(_ value: PasswordProtectedKeyEnvelope) -> RustBuffer {
+        return FfiConverterString.lower(value)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePasswordProtectedKeyEnvelope_lift(_ value: RustBuffer) throws -> PasswordProtectedKeyEnvelope {
+    return try FfiConverterTypePasswordProtectedKeyEnvelope.lift(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePasswordProtectedKeyEnvelope_lower(_ value: PasswordProtectedKeyEnvelope) -> RustBuffer {
+    return FfiConverterTypePasswordProtectedKeyEnvelope.lower(value)
+}
+
+
+
+public typealias PublicKey = String
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePublicKey: FfiConverter {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PublicKey {
+        return try FfiConverterString.read(from: &buf)
+    }
+
+    public static func write(_ value: PublicKey, into buf: inout [UInt8]) {
+        return FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func lift(_ value: RustBuffer) throws -> PublicKey {
+        return try FfiConverterString.lift(value)
+    }
+
+    public static func lower(_ value: PublicKey) -> RustBuffer {
+        return FfiConverterString.lower(value)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePublicKey_lift(_ value: RustBuffer) throws -> PublicKey {
+    return try FfiConverterTypePublicKey.lift(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePublicKey_lower(_ value: PublicKey) -> RustBuffer {
+    return FfiConverterTypePublicKey.lower(value)
+}
+
+
+
+public typealias SecretProtectedKeyEnvelope = String
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSecretProtectedKeyEnvelope: FfiConverter {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SecretProtectedKeyEnvelope {
+        return try FfiConverterString.read(from: &buf)
+    }
+
+    public static func write(_ value: SecretProtectedKeyEnvelope, into buf: inout [UInt8]) {
+        return FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func lift(_ value: RustBuffer) throws -> SecretProtectedKeyEnvelope {
+        return try FfiConverterString.lift(value)
+    }
+
+    public static func lower(_ value: SecretProtectedKeyEnvelope) -> RustBuffer {
+        return FfiConverterString.lower(value)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSecretProtectedKeyEnvelope_lift(_ value: RustBuffer) throws -> SecretProtectedKeyEnvelope {
+    return try FfiConverterTypeSecretProtectedKeyEnvelope.lift(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSecretProtectedKeyEnvelope_lower(_ value: SecretProtectedKeyEnvelope) -> RustBuffer {
+    return FfiConverterTypeSecretProtectedKeyEnvelope.lower(value)
+}
+
+
+
+public typealias SignedPublicKey = String
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSignedPublicKey: FfiConverter {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SignedPublicKey {
+        return try FfiConverterString.read(from: &buf)
+    }
+
+    public static func write(_ value: SignedPublicKey, into buf: inout [UInt8]) {
+        return FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func lift(_ value: RustBuffer) throws -> SignedPublicKey {
+        return try FfiConverterString.lift(value)
+    }
+
+    public static func lower(_ value: SignedPublicKey) -> RustBuffer {
+        return FfiConverterString.lower(value)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignedPublicKey_lift(_ value: RustBuffer) throws -> SignedPublicKey {
+    return try FfiConverterTypeSignedPublicKey.lift(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignedPublicKey_lower(_ value: SignedPublicKey) -> RustBuffer {
+    return FfiConverterTypeSignedPublicKey.lower(value)
+}
+
+
+
+public typealias SymmetricCryptoKey = String
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSymmetricCryptoKey: FfiConverter {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SymmetricCryptoKey {
+        return try FfiConverterString.read(from: &buf)
+    }
+
+    public static func write(_ value: SymmetricCryptoKey, into buf: inout [UInt8]) {
+        return FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func lift(_ value: RustBuffer) throws -> SymmetricCryptoKey {
+        return try FfiConverterString.lift(value)
+    }
+
+    public static func lower(_ value: SymmetricCryptoKey) -> RustBuffer {
+        return FfiConverterString.lower(value)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSymmetricCryptoKey_lift(_ value: RustBuffer) throws -> SymmetricCryptoKey {
+    return try FfiConverterTypeSymmetricCryptoKey.lift(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSymmetricCryptoKey_lower(_ value: SymmetricCryptoKey) -> RustBuffer {
+    return FfiConverterTypeSymmetricCryptoKey.lower(value)
+}
+
+
+
+public typealias UnsignedSharedKey = String
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUnsignedSharedKey: FfiConverter {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UnsignedSharedKey {
+        return try FfiConverterString.read(from: &buf)
+    }
+
+    public static func write(_ value: UnsignedSharedKey, into buf: inout [UInt8]) {
+        return FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func lift(_ value: RustBuffer) throws -> UnsignedSharedKey {
+        return try FfiConverterString.lift(value)
+    }
+
+    public static func lower(_ value: UnsignedSharedKey) -> RustBuffer {
+        return FfiConverterString.lower(value)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUnsignedSharedKey_lift(_ value: RustBuffer) throws -> UnsignedSharedKey {
+    return try FfiConverterTypeUnsignedSharedKey.lift(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUnsignedSharedKey_lower(_ value: UnsignedSharedKey) -> RustBuffer {
+    return FfiConverterTypeUnsignedSharedKey.lower(value)
 }
 
 
@@ -839,19 +1741,22 @@ private enum InitializationResult {
 }
 // Use a global variable to perform the versioning checks. Swift ensures that
 // the code inside is only computed once.
-private var initializationResult: InitializationResult = {
+private let initializationResult: InitializationResult = {
     // Get the bindings contract version from our ComponentInterface
-    let bindings_contract_version = 26
+    let bindings_contract_version = 30
     // Get the scaffolding contract version by calling the into the dylib
     let scaffolding_contract_version = ffi_bitwarden_crypto_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
 
+    uniffiEnsureBitwardenEncodingInitialized()
     return InitializationResult.ok
 }()
 
-private func uniffiEnsureInitialized() {
+// Make the ensure init function public so that other modules which have external type references to
+// our types can call it.
+public func uniffiEnsureBitwardenCryptoInitialized() {
     switch initializationResult {
     case .ok:
         break

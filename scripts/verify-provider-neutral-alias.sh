@@ -37,10 +37,24 @@ expected_schema_version="$(jq -er '.aliasReferenceSchemaVersion | tostring' "$pr
 [[ "$expected_package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]] \
     || fail "provenance package version is not a prerelease"
 
+if [[ -n "$candidate_directory" ]]; then
+    [[ "$(jq -r '.build.kind // empty' "$provenance")" != "local-native" ]] \
+        || fail "candidate comparison is unsupported for local-native provenance; run without a candidate directory"
+    jq -e '
+        .verifiedEvidence as $evidence |
+        ($evidence | type) == "object" and
+        (["swiftArchiveSha256", "checksumIndexSha256", "handoffManifestSha256",
+          "cycloneDxSbomSha256", "sigstoreBundleSha256", "swiftApiReportSha256",
+          "auditReportSha256"] | all(.[];
+            $evidence[.] | if type == "string" then test("^[0-9a-f]{64}$") else false end))
+    ' "$provenance" >/dev/null \
+        || fail "candidate comparison requires all seven preverified evidence SHA-256 hashes in provenance"
+fi
+
 [[ "$(tr -d '[:space:]' <VERSION)" == "$expected_source_commit" ]] \
-    || fail "VERSION does not identify the attested SDK source"
+    || fail "VERSION does not identify the declared SDK source"
 [[ "$(tr -d '[:space:]' <PACKAGE_VERSION)" == "$expected_package_version" ]] \
-    || fail "PACKAGE_VERSION does not identify the release candidate"
+    || fail "PACKAGE_VERSION does not identify the declared package version"
 [[ "$(tr -d '[:space:]' <ALIAS_REFERENCE_SCHEMA_VERSION)" == "$expected_schema_version" ]] \
     || fail "alias reference schema is not version 1"
 grep -q 'GNU GENERAL PUBLIC LICENSE' LICENSE_GPL.txt \
@@ -311,9 +325,9 @@ if [[ -n "$candidate_directory" ]]; then
         "$expected_package_version" ]] \
         || fail "Swift archive package version differs from candidate"
     diff -qr "$candidate_package/Sources" Sources >/dev/null \
-        || fail "public generated sources differ from the attested Swift archive"
+        || fail "public generated sources differ from the candidate Swift archive"
     cmp -s "$candidate_package/LICENSE_GPL.txt" LICENSE_GPL.txt \
-        || fail "public GPL license differs from the attested Swift archive"
+        || fail "public GPL license differs from the candidate Swift archive"
 
     "$repository_root/scripts/create-xcframework-zip.sh" \
         "$candidate_package/BitwardenFFI.xcframework" \

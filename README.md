@@ -21,3 +21,14 @@ normalizing archive ordering, timestamps, and permissions.
 
 This is a local native build distribution. Provenance records only checks
 actually performed; it does not claim a GitHub Actions build or attestation.
+Use the verifier without arguments for this distribution. Passing an extracted
+release candidate directory is unsupported for `build.kind: local-native`.
+
+The optional candidate-directory mode compares a separately preverified candidate
+against provenance containing all seven `verifiedEvidence` SHA-256 hashes:
+Swift archive, checksum index, handoff manifest, CycloneDX SBOM, Sigstore bundle,
+Swift API report, and dependency audit report. It retains the package, ABI,
+checksum, audit, source, and reproducible archive checks. It checks the pinned
+Sigstore bundle bytes, but does not itself verify signatures or establish the
+attestation's trust. Do not add candidate evidence claims to local-native
+provenance merely to enable this mode.
